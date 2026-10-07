@@ -88,8 +88,8 @@ converge donc toujours, au prix d'un rendu complet du tableau — négligeable �
 Sans authentification, tout ce qui atteint le port peut modifier le tableau. Deux garde-fous
 empêchent une page web ouverte dans le même navigateur de le piloter :
 
-- les écritures dont l'en-tête `Origin` ne correspond pas à `Host`, ou marquées
-  `Sec-Fetch-Site: cross-site`, sont refusées (anti-CSRF) ;
+- les écritures dont l'en-tête `Origin` ne correspond pas à `Host`, ou dont `Sec-Fetch-Site`
+  n'est ni `same-origin` ni `none`, sont refusées (anti-CSRF) ;
 - quand l'écoute est sur loopback, seuls les noms d'hôte loopback sont servis (anti
   DNS-rebinding).
 

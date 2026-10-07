@@ -30,7 +30,9 @@ Tout est optionnel. Ordre de priorité : variables d'environnement, puis fichier
 | `db_path`             | `HELM_DB`             | `helm.db`        | Fichier SQLite (mode WAL).                     |
 
 Le fichier lu est `helm.toml` dans le répertoire courant s'il existe, ou celui désigné par
-`HELM_CONFIG`. Modèle : [helm.example.toml](helm.example.toml).
+`HELM_CONFIG`. Un `helm.toml` absent laisse les défauts ; un fichier présent mais illisible ou
+invalide (clé inconnue comprise), ou un `HELM_CONFIG` introuvable, fait échouer le démarrage.
+Modèle : [helm.example.toml](helm.example.toml).
 
 Helm n'a pas d'authentification : gardez l'écoute sur loopback, ou placez un proxy ou un VPN de
 confiance devant.

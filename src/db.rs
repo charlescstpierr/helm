@@ -98,7 +98,7 @@ impl Db {
         })
     }
 
-    /// Runs `f` with exclusive access to the connection, off the async worker threads.
+    /// Runs `f` with exclusive access to the connection, off the async runtime thread.
     pub async fn call<F, T, E>(&self, f: F) -> Result<T, E>
     where
         F: FnOnce(&mut Connection) -> Result<T, E> + Send + 'static,

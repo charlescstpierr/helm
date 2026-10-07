@@ -141,6 +141,8 @@ async fn guard(State(state): State<AppState>, request: Request, next: Next) -> R
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
+    // Not `no-referrer`: under it browsers send `Origin: null` on plain form posts, which
+    // `same_origin` rejects.
     headers.insert(
         header::REFERRER_POLICY,
         HeaderValue::from_static("same-origin"),
