@@ -1,8 +1,8 @@
 # helm
 
 Kanban auto-hébergé en Rust pour développeur solo, destiné à orchestrer des agents de code
-(`claude -p`, `codex exec`). Cette première version livre le tableau ; l'orchestration est
-conçue dans [docs/architecture.md](docs/architecture.md) et viendra ensuite.
+(`claude -p`, `codex exec`). Cette version livre le tableau et les commentaires ;
+l'orchestration est conçue dans [docs/architecture.md](docs/architecture.md) et viendra ensuite.
 
 ## Lancer
 
@@ -19,6 +19,10 @@ la base est créée et migrée au premier démarrage. `Ctrl-C` arrête propremen
 
 Dans le tableau : flèches pour naviguer, `Alt` + flèches pour déplacer une carte, `Entrée`
 pour l'ouvrir, `N` pour en créer une.
+
+Chaque carte a un fil de commentaires, sous son formulaire d'édition (`Ctrl` + `Entrée` envoie).
+`@claude`, `@codex` et `@moi` y sont reconnus et enregistrés comme mentions non traitées ; rien
+ne les consomme encore. Le nombre de commentaires s'affiche sur la carte quand il n'est pas nul.
 
 ## Configurer
 
@@ -53,7 +57,7 @@ données, cycle de vie des cartes et conception de l'orchestrateur :
 ## Développer
 
 ```sh
-cargo test                                   # logique des cartes, migrations, routes
+cargo test                                   # cartes, commentaires et mentions, migrations, routes
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```

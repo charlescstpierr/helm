@@ -400,6 +400,19 @@ textarea.input {
   --label-color: var(--label-7);
 }
 
+.card__comments {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  color: var(--color-text-muted);
+  font-size: var(--font-size-xs);
+}
+
+.icon {
+  width: var(--icon-size);
+  height: var(--icon-size);
+}
+
 .quick-add {
   display: flex;
   gap: var(--space-2);
@@ -501,6 +514,86 @@ kbd {
 
 .form__spacer {
   flex: 1;
+}
+
+.comments {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin-top: var(--space-5);
+  padding-top: var(--space-4);
+  border-top: var(--border-width) solid var(--color-border);
+}
+
+.comments__title {
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-bold);
+}
+
+.thread__empty {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+}
+
+.thread__list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.comment {
+  padding: var(--space-2) var(--space-3);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-sunken);
+}
+
+.comment[data-author-kind="agent"] {
+  border-inline-start: var(--card-accent-width) solid var(--color-accent);
+}
+
+.comment[data-author-kind="system"] {
+  color: var(--color-text-muted);
+}
+
+.comment:target {
+  outline: var(--focus-width) solid var(--color-focus);
+}
+
+.comment__header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+  font-size: var(--font-size-sm);
+}
+
+.comment__author {
+  font-weight: var(--font-weight-bold);
+}
+
+.comment__time {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-xs);
+}
+
+.comment__body {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.mention {
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--color-accent) var(--mention-tint), transparent);
+  color: var(--color-accent);
+  font-weight: var(--font-weight-medium);
+}
+
+.comment-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
 }
 
 @media (prefers-reduced-motion: reduce) {

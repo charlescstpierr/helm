@@ -6,14 +6,17 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{Connection, OptionalExtension, Transaction};
 
 use crate::db::DbError;
+use crate::mentions::{self, Segment};
 
 pub const MAX_TITLE_CHARS: usize = 200;
 pub const MAX_DESCRIPTION_CHARS: usize = 20_000;
 pub const MAX_LABELS_PER_CARD: usize = 10;
 pub const MAX_LABEL_CHARS: usize = 32;
+pub const MAX_COMMENT_CHARS: usize = 20_000;
 /// Number of `--label-N` colour slots defined in `assets/tokens.css`.
 pub const LABEL_COLOR_SLOTS: u32 = 8;
 
@@ -86,6 +89,7 @@ pub struct Card {
     pub description: String,
     pub priority: i64,
     pub labels: Vec<Label>,
+    pub comment_count: i64,
 }
 
 impl Card {
@@ -251,7 +255,9 @@ pub fn load_board(conn: &Connection) -> Result<Board> {
     let mut labels = labels_by_card(conn, "c.project_id = ?1", project.id)?;
     let cards: Vec<Card> = conn
         .prepare(
-            "SELECT id, column_id, number, title, description, priority FROM cards
+            "SELECT id, column_id, number, title, description, priority,
+                    (SELECT COUNT(*) FROM comments WHERE card_id = cards.id)
+             FROM cards
              WHERE project_id = ?1 ORDER BY column_id, position, id",
         )?
         .query_map([project.id], card_from_row)?
@@ -274,7 +280,9 @@ pub fn load_board(conn: &Connection) -> Result<Board> {
 pub fn get_card(conn: &Connection, id: i64) -> Result<Card> {
     let mut card = conn
         .query_row(
-            "SELECT id, column_id, number, title, description, priority FROM cards
+            "SELECT id, column_id, number, title, description, priority,
+                    (SELECT COUNT(*) FROM comments WHERE card_id = cards.id)
+             FROM cards
              WHERE id = ?1",
             [id],
             card_from_row,
@@ -296,6 +304,7 @@ fn card_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Card> {
         description: row.get(4)?,
         priority: row.get(5)?,
         labels: Vec::new(),
+        comment_count: row.get(6)?,
     })
 }
 
@@ -495,6 +504,161 @@ fn prune_labels(tx: &Transaction<'_>, project_id: i64) -> Result<()> {
         [project_id],
     )?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorKind {
+    Human,
+    Agent,
+    System,
+}
+
+impl AuthorKind {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Agent => "agent",
+            Self::System => "system",
+        }
+    }
+}
+
+impl ToSql for AuthorKind {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        self.slug().to_sql()
+    }
+}
+
+impl FromSql for AuthorKind {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value.as_str()? {
+            "human" => Ok(Self::Human),
+            "agent" => Ok(Self::Agent),
+            "system" => Ok(Self::System),
+            other => Err(FromSqlError::Other(
+                format!("unknown author kind {other:?}").into(),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Author {
+    pub kind: AuthorKind,
+    pub name: String,
+}
+
+impl Author {
+    pub fn moi() -> Self {
+        Self {
+            kind: AuthorKind::Human,
+            name: "moi".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Comment {
+    pub id: i64,
+    pub author: Author,
+    pub body: String,
+    pub created_at: i64,
+}
+
+impl Comment {
+    pub fn segments(&self) -> Vec<Segment<'_>> {
+        mentions::segments(&self.body)
+    }
+
+    pub fn created_iso(&self) -> String {
+        utc_iso(self.created_at)
+    }
+
+    pub fn created_display(&self) -> String {
+        let iso = self.created_iso();
+        format!("{} {} UTC", &iso[..10], &iso[11..16])
+    }
+}
+
+fn utc_iso(timestamp: i64) -> String {
+    let (year, month, day) = civil_from_days(timestamp.div_euclid(86_400));
+    let seconds = timestamp.rem_euclid(86_400);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        seconds / 3_600,
+        seconds % 3_600 / 60,
+        seconds % 60
+    )
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
+    let z = days_since_epoch + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    (year_of_era + era * 400 + i64::from(month <= 2), month, day)
+}
+
+pub fn list_comments(conn: &Connection, card_id: i64) -> Result<Vec<Comment>> {
+    Ok(conn
+        .prepare(
+            "SELECT id, author_kind, author, body, created_at FROM comments
+             WHERE card_id = ?1 ORDER BY id",
+        )?
+        .query_map([card_id], |row| {
+            Ok(Comment {
+                id: row.get(0)?,
+                author: Author {
+                    kind: row.get(1)?,
+                    name: row.get(2)?,
+                },
+                body: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+pub fn add_comment(
+    conn: &mut Connection,
+    card_id: i64,
+    author: &Author,
+    body: &str,
+) -> Result<i64> {
+    let body = body.replace("\r\n", "\n");
+    let body = body.trim_start_matches('\n').trim_end();
+    if body.trim().is_empty() {
+        return invalid("Le commentaire est vide.");
+    }
+    if body.chars().count() > MAX_COMMENT_CHARS {
+        return invalid(format!(
+            "Le commentaire dépasse {MAX_COMMENT_CHARS} caractères."
+        ));
+    }
+    let tx = conn.transaction()?;
+    card_location(&tx, card_id)?;
+    tx.execute(
+        "INSERT INTO comments (card_id, author_kind, author, body) VALUES (?1, ?2, ?3, ?4)",
+        (card_id, author.kind, &author.name, body),
+    )?;
+    let comment_id = tx.last_insert_rowid();
+    for target in mentions::mentioned_targets(body) {
+        tx.execute(
+            "INSERT INTO mentions (comment_id, target) VALUES (?1, ?2)",
+            (comment_id, target.slug()),
+        )?;
+    }
+    tx.commit()?;
+    Ok(comment_id)
 }
 
 #[cfg(test)]
@@ -800,5 +964,210 @@ mod tests {
         let column = column_ids(&conn)[0];
         let title = "é".repeat(MAX_TITLE_CHARS);
         assert!(create_card(&mut conn, column, &input(&title)).is_ok());
+    }
+
+    fn card_in_first_column(conn: &mut Connection) -> i64 {
+        let column = column_ids(conn)[0];
+        create_card(conn, column, &input("Card")).unwrap()
+    }
+
+    fn mention_rows(conn: &Connection) -> Vec<(i64, String, Option<i64>)> {
+        conn.prepare("SELECT comment_id, target, handled_at FROM mentions ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn comment_rows(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM comments", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_comment_records_one_unhandled_mention_per_known_target() {
+        let mut conn = test_conn();
+        let card = card_in_first_column(&mut conn);
+        let id = add_comment(
+            &mut conn,
+            card,
+            &Author::moi(),
+            "@codex take this, @Codex again, cc @claude. Mail a@moi.fr about @param",
+        )
+        .unwrap();
+
+        assert_eq!(
+            mention_rows(&conn),
+            [
+                (id, "codex".to_owned(), None),
+                (id, "claude".to_owned(), None)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_comment_without_a_known_mention_records_none() {
+        let mut conn = test_conn();
+        let card = card_in_first_column(&mut conn);
+        add_comment(&mut conn, card, &Author::moi(), "mail me at x@codex.com").unwrap();
+        assert_eq!(mention_rows(&conn), []);
+    }
+
+    #[test]
+    fn a_failed_mention_insert_leaves_no_comment_behind() {
+        let mut conn = test_conn();
+        let card = card_in_first_column(&mut conn);
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_mentions BEFORE INSERT ON mentions
+             BEGIN SELECT RAISE(ABORT, 'no mentions today'); END;",
+        )
+        .unwrap();
+
+        assert!(add_comment(&mut conn, card, &Author::moi(), "@codex hi").is_err());
+
+        assert_eq!(comment_rows(&conn), 0);
+        assert!(list_comments(&conn, card).unwrap().is_empty());
+    }
+
+    #[test]
+    fn threads_are_chronological_and_per_card() {
+        let mut conn = test_conn();
+        let first = card_in_first_column(&mut conn);
+        let second = card_in_first_column(&mut conn);
+        for body in ["one", "two", "three"] {
+            add_comment(&mut conn, first, &Author::moi(), body).unwrap();
+        }
+        add_comment(&mut conn, second, &Author::moi(), "elsewhere").unwrap();
+
+        let thread = list_comments(&conn, first).unwrap();
+        let bodies: Vec<&str> = thread.iter().map(|c| c.body.as_str()).collect();
+        assert_eq!(bodies, ["one", "two", "three"]);
+        assert!(thread.iter().all(|c| c.author == Author::moi()));
+        assert_eq!(list_comments(&conn, second).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn author_kind_and_name_round_trip() {
+        let mut conn = test_conn();
+        let card = card_in_first_column(&mut conn);
+        let codex = Author {
+            kind: AuthorKind::Agent,
+            name: "codex".to_owned(),
+        };
+        let helm = Author {
+            kind: AuthorKind::System,
+            name: "helm".to_owned(),
+        };
+        add_comment(&mut conn, card, &codex, "done").unwrap();
+        add_comment(&mut conn, card, &helm, "run finished").unwrap();
+
+        let authors: Vec<Author> = list_comments(&conn, card)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.author)
+            .collect();
+        assert_eq!(authors, [codex, helm]);
+    }
+
+    #[test]
+    fn comment_bodies_are_validated_and_normalised() {
+        let mut conn = test_conn();
+        let card = card_in_first_column(&mut conn);
+        for empty in ["", "   ", "\n\r\n \t"] {
+            assert!(
+                matches!(
+                    add_comment(&mut conn, card, &Author::moi(), empty),
+                    Err(StoreError::Invalid(_))
+                ),
+                "{empty:?}"
+            );
+        }
+        let too_long = "é".repeat(MAX_COMMENT_CHARS + 1);
+        assert!(matches!(
+            add_comment(&mut conn, card, &Author::moi(), &too_long),
+            Err(StoreError::Invalid(_))
+        ));
+        let at_limit = "é".repeat(MAX_COMMENT_CHARS);
+        assert!(add_comment(&mut conn, card, &Author::moi(), &at_limit).is_ok());
+        assert_eq!(comment_rows(&conn), 1);
+
+        add_comment(
+            &mut conn,
+            card,
+            &Author::moi(),
+            "\r\n\r\nline 1\r\n  line 2  \r\n\r\n",
+        )
+        .unwrap();
+        let last = list_comments(&conn, card).unwrap().pop().unwrap();
+        assert_eq!(last.body, "line 1\n  line 2");
+    }
+
+    #[test]
+    fn commenting_on_a_missing_card_stores_nothing() {
+        let mut conn = test_conn();
+        assert!(matches!(
+            add_comment(&mut conn, 42, &Author::moi(), "@codex hi"),
+            Err(StoreError::NotFound)
+        ));
+        assert_eq!(comment_rows(&conn), 0);
+        assert_eq!(mention_rows(&conn), []);
+    }
+
+    #[test]
+    fn the_board_counts_comments_per_card() {
+        let mut conn = test_conn();
+        let busy = card_in_first_column(&mut conn);
+        let quiet = card_in_first_column(&mut conn);
+        add_comment(&mut conn, busy, &Author::moi(), "a").unwrap();
+        add_comment(&mut conn, busy, &Author::moi(), "b").unwrap();
+
+        assert_eq!(get_card(&conn, busy).unwrap().comment_count, 2);
+        assert_eq!(get_card(&conn, quiet).unwrap().comment_count, 0);
+        let board = load_board(&conn).unwrap();
+        let counts: Vec<i64> = board.columns[0]
+            .cards
+            .iter()
+            .map(|c| c.comment_count)
+            .collect();
+        assert_eq!(counts, [2, 0]);
+    }
+
+    #[test]
+    fn deleting_a_card_deletes_its_thread_and_mentions() {
+        let mut conn = test_conn();
+        let doomed = card_in_first_column(&mut conn);
+        let kept = card_in_first_column(&mut conn);
+        add_comment(&mut conn, doomed, &Author::moi(), "@codex bye").unwrap();
+        add_comment(&mut conn, kept, &Author::moi(), "@claude stay").unwrap();
+
+        delete_card(&mut conn, doomed).unwrap();
+
+        assert!(list_comments(&conn, doomed).unwrap().is_empty());
+        assert_eq!(list_comments(&conn, kept).unwrap().len(), 1);
+        let remaining: Vec<String> = mention_rows(&conn).into_iter().map(|r| r.1).collect();
+        assert_eq!(remaining, ["claude"]);
+    }
+
+    #[test]
+    fn timestamps_are_formatted_as_utc() {
+        for (timestamp, expected) in [
+            (0, "1970-01-01T00:00:00Z"),
+            (86_399, "1970-01-01T23:59:59Z"),
+            (951_782_400, "2000-02-29T00:00:00Z"),
+            (1_709_164_799, "2024-02-28T23:59:59Z"),
+            (1_791_383_525, "2026-10-07T14:32:05Z"),
+            (4_102_444_800, "2100-01-01T00:00:00Z"),
+            (-1, "1969-12-31T23:59:59Z"),
+        ] {
+            assert_eq!(utc_iso(timestamp), expected);
+        }
+        let comment = Comment {
+            id: 1,
+            author: Author::moi(),
+            body: String::new(),
+            created_at: 1_791_383_525,
+        };
+        assert_eq!(comment.created_display(), "2026-10-07 14:32 UTC");
     }
 }

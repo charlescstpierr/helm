@@ -19,7 +19,7 @@ use tokio::sync::broadcast::{self, error::RecvError};
 
 use crate::assets;
 use crate::db::Db;
-use crate::store::{self, Board, Card, CardInput, StoreError};
+use crate::store::{self, Author, Board, Card, CardInput, Comment, StoreError};
 
 /// Sent by `assets/app.js` on its own requests: the server then answers with a fragment or
 /// an empty 204 instead of a full page or a redirect.
@@ -64,6 +64,10 @@ pub fn router(state: AppState) -> Router {
         .route("/cards/{id}", post(update_card))
         .route("/cards/{id}/edit", get(edit_card))
         .route("/cards/{id}/move", post(move_card))
+        .route(
+            "/cards/{id}/comments",
+            get(comment_thread).post(add_comment),
+        )
         .route(
             "/cards/{id}/delete",
             get(confirm_delete_card).post(delete_card),
@@ -226,13 +230,21 @@ struct CardDeletePage {
 struct CardEditPage {
     board: Board,
     card: Card,
+    comments: Vec<Comment>,
 }
 
 #[derive(Template)]
-#[template(path = "_card_form.html")]
-struct CardFormFragment {
+#[template(path = "_card_panel.html")]
+struct CardPanelFragment {
     board: Board,
     card: Card,
+    comments: Vec<Comment>,
+}
+
+#[derive(Template)]
+#[template(path = "_thread.html")]
+struct ThreadFragment {
+    comments: Vec<Comment>,
 }
 
 async fn board_page(State(state): State<AppState>) -> AppResult<Html<String>> {
@@ -264,18 +276,46 @@ async fn edit_card(
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> AppResult<Html<String>> {
-    let (board, card) = state
+    let (board, card, comments) = state
         .db
         .call(move |conn| {
-            Ok::<_, StoreError>((store::load_board(conn)?, store::get_card(conn, id)?))
+            Ok::<_, StoreError>((
+                store::load_board(conn)?,
+                store::get_card(conn, id)?,
+                store::list_comments(conn, id)?,
+            ))
         })
         .await?;
     let html = if is_fetch(&headers) {
-        CardFormFragment { board, card }.render()?
+        CardPanelFragment {
+            board,
+            card,
+            comments,
+        }
+        .render()?
     } else {
-        CardEditPage { board, card }.render()?
+        CardEditPage {
+            board,
+            card,
+            comments,
+        }
+        .render()?
     };
     Ok(Html(html))
+}
+
+async fn comment_thread(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> AppResult<Html<String>> {
+    let comments = state
+        .db
+        .call(move |conn| {
+            store::get_card(conn, id)?;
+            store::list_comments(conn, id)
+        })
+        .await?;
+    Ok(Html(ThreadFragment { comments }.render()?))
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +407,29 @@ async fn delete_card(
         .await?;
     state.board_changed();
     Ok(written(&headers))
+}
+
+#[derive(Deserialize)]
+struct CommentForm {
+    body: String,
+}
+
+async fn add_comment(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Form(form): Form<CommentForm>,
+) -> AppResult<Response> {
+    let comment_id = state
+        .db
+        .call(move |conn| store::add_comment(conn, id, &Author::moi(), &form.body))
+        .await?;
+    state.board_changed();
+    if is_fetch(&headers) {
+        Ok(StatusCode::NO_CONTENT.into_response())
+    } else {
+        Ok(Redirect::to(&format!("/cards/{id}/edit#comment-{comment_id}")).into_response())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -691,5 +754,120 @@ mod tests {
         let text = String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap();
         assert!(text.contains("event: board"), "{text}");
         assert!(text.contains("data: 1"), "{text}");
+    }
+
+    const COMMENT: &str =
+        "body=%40codex+please+look%0Amail+a%40codex.com+%3Cscript%3Ex%3C%2Fscript%3E";
+
+    #[tokio::test]
+    async fn a_comment_posted_without_script_lands_in_the_thread_on_the_card_page() {
+        let app = app();
+        post_form(&app, "/cards", "column_id=1&title=Talk").await;
+
+        let request = post("/cards/1/comments").body(Body::from(COMMENT)).unwrap();
+        let (status, headers, _) = send(&app, request).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(headers[header::LOCATION], "/cards/1/edit#comment-1");
+
+        let (_, _, page) = send(&app, get("/cards/1/edit")).await;
+        assert!(page.contains("id=\"comment-1\""), "{page}");
+        assert!(page.contains("data-author-kind=\"human\""));
+        assert!(page.contains("moi"));
+        assert!(page.contains("<span class=\"mention\" data-target=\"codex\">@codex</span> please look\nmail a@codex.com"));
+        assert!(!page.contains("<script>x"), "comment body must be escaped");
+        assert!(page.contains("&lt;script&gt;x") || page.contains("&#60;script&#62;x"));
+        assert!(page.contains("action=\"/cards/1/comments\""));
+    }
+
+    #[tokio::test]
+    async fn the_dialog_fragment_and_the_thread_fragment_show_comments_in_order() {
+        let app = app();
+        post_form(&app, "/cards", "column_id=1&title=Talk").await;
+        assert_eq!(
+            post_form(&app, "/cards/1/comments", "body=first").await,
+            StatusCode::NO_CONTENT
+        );
+        post_form(&app, "/cards/1/comments", "body=second").await;
+
+        let mut dialog = get("/cards/1/edit");
+        dialog
+            .headers_mut()
+            .insert(FETCH_HEADER, HeaderValue::from_static("fetch"));
+        let (_, _, dialog) = send(&app, dialog).await;
+        assert!(!dialog.contains("<html"));
+        assert!(dialog.find("first").unwrap() < dialog.find("second").unwrap());
+
+        let (status, _, thread) = send(&app, get("/cards/1/comments")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(thread.starts_with("<div class=\"thread\" id=\"comment-thread\">"));
+        assert!(!thread.contains("<form"));
+        assert!(thread.find("first").unwrap() < thread.find("second").unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_board_shows_a_comment_count_only_when_it_is_not_zero() {
+        let app = app();
+        post_form(&app, "/cards", "column_id=1&title=Quiet").await;
+        let (_, _, board) = send(&app, get("/board")).await;
+        assert!(!board.contains("card__comments"));
+
+        post_form(&app, "/cards/1/comments", "body=a").await;
+        post_form(&app, "/cards/1/comments", "body=b").await;
+        let (_, _, board) = send(&app, get("/board")).await;
+        assert!(board.contains("card__comments"));
+        assert!(board.contains("Commentaires : </span>2"), "{board}");
+    }
+
+    #[tokio::test]
+    async fn bad_comment_requests_are_reported_and_store_nothing() {
+        let app = app();
+        post_form(&app, "/cards", "column_id=1&title=Talk").await;
+        assert_eq!(
+            post_form(&app, "/cards/1/comments", "body=+%0A+").await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            post_form(&app, "/cards/42/comments", "body=hi").await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            send(&app, get("/cards/42/comments")).await.0,
+            StatusCode::NOT_FOUND
+        );
+        let (_, _, thread) = send(&app, get("/cards/1/comments")).await;
+        assert!(thread.contains("Aucun commentaire."));
+    }
+
+    #[tokio::test]
+    async fn a_cross_site_page_cannot_post_comments() {
+        let app = app();
+        post_form(&app, "/cards", "column_id=1&title=Talk").await;
+        let forged = post("/cards/1/comments")
+            .header(header::ORIGIN, "http://evil.example")
+            .body(Body::from("body=@codex+rm+-rf"))
+            .unwrap();
+        assert_eq!(send(&app, forged).await.0, StatusCode::FORBIDDEN);
+        let (_, _, thread) = send(&app, get("/cards/1/comments")).await;
+        assert!(thread.contains("Aucun commentaire."));
+    }
+
+    #[tokio::test]
+    async fn posting_a_comment_wakes_the_open_browsers() {
+        let app = app();
+        post_form(&app, "/cards", "column_id=1&title=Talk").await;
+        let response = app.clone().oneshot(get("/events")).await.unwrap();
+        let mut body = response.into_body();
+        assert_eq!(
+            post_form(&app, "/cards/1/comments", "body=hello").await,
+            StatusCode::NO_CONTENT
+        );
+        let frame = tokio::time::timeout(Duration::from_secs(5), body.frame())
+            .await
+            .expect("an SSE frame after a comment")
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap();
+        assert!(text.contains("event: board"), "{text}");
+        assert!(text.contains("data: 2"), "{text}");
     }
 }

@@ -1,0 +1,17 @@
+<div class="thread" id="comment-thread">
+  {% if comments.is_empty() %}
+  <p class="thread__empty">Aucun commentaire.</p>
+  {% else %}
+  <ol class="thread__list">
+    {% for comment in comments %}
+    <li class="comment" id="comment-{{ comment.id }}" data-author-kind="{{ comment.author.kind.slug() }}">
+      <header class="comment__header">
+        <span class="comment__author">{{ comment.author.name }}</span>
+        <time class="comment__time" datetime="{{ comment.created_iso() }}">{{ comment.created_display() }}</time>
+      </header>
+      <p class="comment__body">{% for segment in comment.segments() %}{% match segment %}{% when crate::mentions::Segment::Text(text) %}{{ text }}{% when crate::mentions::Segment::Mention { text, target } %}<span class="mention" data-target="{{ target.slug() }}">{{ text }}</span>{% endmatch %}{% endfor %}</p>
+    </li>
+    {% endfor %}
+  </ol>
+  {% endif %}
+</div>

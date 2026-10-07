@@ -269,6 +269,71 @@
     quickAddInput(column).focus();
   });
 
+  let threadRequest = 0;
+
+  function localizeTimes(root) {
+    for (const time of root.querySelectorAll('time[datetime]')) {
+      const date = new Date(time.dateTime);
+      if (!Number.isNaN(date.getTime())) {
+        time.textContent = date.toLocaleString('fr-FR', { dateStyle: 'short', timeStyle: 'short' });
+      }
+    }
+  }
+
+  const threadElement = () => dialogBody.querySelector('#comment-thread');
+
+  async function refreshThread() {
+    const current = threadElement();
+    if (!dialog.open || !current || !lastOpenedCardId) return;
+    const request = ++threadRequest;
+    try {
+      const response = await fetch(`/cards/${lastOpenedCardId}/comments`, { headers: FETCH_HEADERS });
+      if (!response.ok || request !== threadRequest) return;
+      const template = document.createElement('template');
+      template.innerHTML = await response.text();
+      const next = template.content.getElementById('comment-thread');
+      const live = threadElement();
+      if (!next || !live) return;
+      live.replaceWith(next);
+      localizeTimes(next);
+    } catch {
+      // Offline: the SSE reconnection triggers another refresh.
+    }
+  }
+
+  dialog.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && event.target.matches('#comment-body')) {
+      event.preventDefault();
+      event.target.form.requestSubmit();
+    }
+  });
+
+  dialog.addEventListener('submit', async (event) => {
+    const form = event.target;
+    if (!form.matches('form[data-comment-form]')) return;
+    event.preventDefault();
+    if (form.dataset.submitting) return;
+
+    const field = form.elements.body;
+    const errorBox = form.querySelector('.form__error');
+    const sent = field.value;
+    errorBox.hidden = true;
+    form.dataset.submitting = 'true';
+    try {
+      await post(form.action, new URLSearchParams(new FormData(form)));
+    } catch (error) {
+      errorBox.textContent = error.message;
+      errorBox.hidden = false;
+      return;
+    } finally {
+      delete form.dataset.submitting;
+    }
+    if (field.value === sent) field.value = '';
+    field.focus();
+    refreshThread();
+    refresh();
+  });
+
   // --- Card dialog ---------------------------------------------------------------------
 
   board.addEventListener('click', async (event) => {
@@ -286,6 +351,7 @@
     }
     lastOpenedCardId = link.closest('.card').dataset.cardId;
     dialog.showModal();
+    localizeTimes(dialogBody);
     dialogBody.querySelector('input[name="title"]')?.focus();
   });
 
@@ -380,7 +446,11 @@
     setConnection('live', 'En direct');
     // Nothing is replayed: catch up on writes made before this connection was established.
     refresh();
+    refreshThread();
   });
   events.addEventListener('error', () => setConnection('offline', 'Hors ligne'));
-  events.addEventListener('board', refresh);
+  events.addEventListener('board', () => {
+    refresh();
+    refreshThread();
+  });
 })();

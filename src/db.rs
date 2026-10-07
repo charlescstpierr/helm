@@ -10,11 +10,18 @@ use rusqlite::Connection;
 
 /// Ordered, append-only list of schema migrations embedded in the binary.
 /// Never edit a released migration: add a new one.
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "init",
-    sql: include_str!("../migrations/0001_init.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "init",
+        sql: include_str!("../migrations/0001_init.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "comments",
+        sql: include_str!("../migrations/0002_comments.sql"),
+    },
+];
 
 struct Migration {
     version: i64,
@@ -139,6 +146,10 @@ fn configure(conn: &Connection) -> Result<(), DbError> {
 }
 
 fn migrate(conn: &mut Connection) -> Result<(), DbError> {
+    apply(conn, MIGRATIONS)
+}
+
+fn apply(conn: &mut Connection, migrations: &[Migration]) -> Result<(), DbError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
              version    INTEGER PRIMARY KEY,
@@ -147,14 +158,14 @@ fn migrate(conn: &mut Connection) -> Result<(), DbError> {
          ) STRICT;",
     )?;
     let current = schema_version(conn)?;
-    let supported = MIGRATIONS.last().map_or(0, |m| m.version);
+    let supported = migrations.last().map_or(0, |m| m.version);
     if current > supported {
         return Err(DbError::SchemaTooNew {
             found: current,
             supported,
         });
     }
-    for migration in MIGRATIONS.iter().filter(|m| m.version > current) {
+    for migration in migrations.iter().filter(|m| m.version > current) {
         let tx = conn.transaction()?;
         tx.execute_batch(migration.sql)?;
         tx.execute(
@@ -215,6 +226,103 @@ mod tests {
             names,
             ["Backlog", "À faire", "En cours", "En revue", "Terminé"]
         );
+    }
+
+    #[test]
+    fn a_v0_1_database_upgrades_without_losing_its_cards() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        apply(&mut conn, &MIGRATIONS[..1]).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 1);
+        conn.execute_batch(
+            "INSERT INTO cards (project_id, column_id, number, title, description, position)
+                 VALUES (1, 2, 1, 'Existing', 'kept as is', 0);
+             INSERT INTO labels (project_id, name, name_key, color_slot) VALUES (1, 'infra', 'infra', 3);
+             INSERT INTO card_labels (card_id, label_id) VALUES (1, 1);",
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        assert_eq!(schema_version(&conn).unwrap(), 2);
+        let (title, description): (String, String) = conn
+            .query_row(
+                "SELECT title, description FROM cards WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (title.as_str(), description.as_str()),
+            ("Existing", "kept as is")
+        );
+        assert_eq!(count(&conn, "card_labels"), 1);
+        assert_eq!(count(&conn, "comments"), 0);
+        conn.execute(
+            "INSERT INTO comments (card_id, author_kind, author, body) VALUES (1, 'human', 'moi', 'hi')",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn deleting_a_card_removes_its_comments_and_mentions() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        migrate(&mut conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO cards (project_id, column_id, number, title, position) VALUES (1, 1, 1, 'A', 0);
+             INSERT INTO comments (card_id, author_kind, author, body) VALUES (1, 'human', 'moi', '@codex');
+             INSERT INTO mentions (comment_id, target) VALUES (1, 'codex');",
+        )
+        .unwrap();
+
+        conn.execute("DELETE FROM cards WHERE id = 1", []).unwrap();
+
+        assert_eq!(count(&conn, "comments"), 0);
+        assert_eq!(count(&conn, "mentions"), 0);
+    }
+
+    #[test]
+    fn comments_reject_an_unknown_author_kind_and_an_orphan_card() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        migrate(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO cards (project_id, column_id, number, title, position) VALUES (1, 1, 1, 'A', 0)",
+            [],
+        )
+        .unwrap();
+        let insert = |card: i64, kind: &str| {
+            conn.execute(
+                "INSERT INTO comments (card_id, author_kind, author, body) VALUES (?1, ?2, 'x', 'y')",
+                (card, kind),
+            )
+        };
+        assert!(insert(1, "robot").is_err());
+        assert!(insert(99, "human").is_err());
+        assert!(insert(1, "system").is_ok());
+    }
+
+    #[test]
+    fn unhandled_mentions_are_served_by_a_partial_index() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        migrate(&mut conn).unwrap();
+        let plan: String = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT comment_id FROM mentions
+                 WHERE target = 'codex' AND handled_at IS NULL ORDER BY comment_id",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("; ");
+        assert!(plan.contains("mentions_unhandled"), "{plan}");
+        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
     }
 
     #[test]
