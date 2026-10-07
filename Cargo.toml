@@ -1,0 +1,26 @@
+[package]
+name = "helm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Self-hosted kanban that orchestrates coding agents, for a solo developer"
+publish = false
+
+[dependencies]
+askama = "0.16"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "form"] }
+futures-util = { version = "0.3", default-features = false }
+rusqlite = { version = "0.40", features = ["bundled"] }
+rust-embed = "8"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "signal", "macros", "time"] }
+toml = { version = "1", default-features = false, features = ["parse", "serde"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+strip = true

@@ -1,0 +1,36 @@
+<div class="board" id="board">
+  {% for column in board.columns %}
+  <section class="column" data-column-id="{{ column.id }}" data-category="{{ column.category }}" aria-labelledby="column-{{ column.id }}-title">
+    <header class="column__header">
+      <h2 class="column__title" id="column-{{ column.id }}-title">{{ column.name }}</h2>
+      <span class="column__count"><span class="visually-hidden">Nombre de cartes : </span><span data-count>{{ column.cards.len() }}</span></span>
+    </header>
+    <ol class="column__cards" aria-labelledby="column-{{ column.id }}-title">
+      {% for card in column.cards %}
+      <li class="card" draggable="true" data-card-id="{{ card.id }}" data-priority="{{ card.priority_slug() }}">
+        <a class="card__link" href="/cards/{{ card.id }}/edit" draggable="false">
+          <span class="card__key">{{ board.project.key }}-{{ card.number }}</span>
+          <span class="card__title">{{ card.title }}</span>
+        </a>
+        {% if card.has_priority() || !card.labels.is_empty() %}
+        <ul class="card__meta">
+          {% if card.has_priority() %}
+          <li class="priority" data-priority="{{ card.priority_slug() }}"><span class="visually-hidden">Priorité : </span>{{ card.priority_name() }}</li>
+          {% endif %}
+          {% for label in card.labels %}
+          <li class="label" data-slot="{{ label.color_slot }}">{{ label.name }}</li>
+          {% endfor %}
+        </ul>
+        {% endif %}
+      </li>
+      {% endfor %}
+    </ol>
+    <form class="quick-add" method="post" action="/cards" data-async>
+      <input type="hidden" name="column_id" value="{{ column.id }}">
+      <label class="visually-hidden" for="quick-add-{{ column.id }}">Nouvelle carte dans {{ column.name }}</label>
+      <input class="input" id="quick-add-{{ column.id }}" name="title" type="text" required maxlength="200" autocomplete="off" placeholder="Ajouter une carte…">
+      <button class="button" type="submit">Ajouter</button>
+    </form>
+  </section>
+  {% endfor %}
+</div>
