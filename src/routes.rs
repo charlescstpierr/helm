@@ -17,7 +17,9 @@ use futures_util::stream::{self, Stream};
 use serde::Deserialize;
 use tokio::sync::broadcast::{self, error::RecvError};
 
+use crate::agent::{Agent, ModelName};
 use crate::assets;
+use crate::config::RunGate;
 use crate::db::Db;
 use crate::store::{self, Author, Board, Card, CardInput, Comment, StoreError};
 
@@ -36,16 +38,44 @@ pub struct AppState {
     revision: Arc<AtomicU64>,
     /// When bound to loopback, only loopback `Host` names are served (DNS-rebinding guard).
     loopback_only: bool,
+    agents: AgentsView,
+}
+
+/// What the card form needs to know about the orchestrator: whether agents can be assigned
+/// and run, and which model a blank field stands for.
+#[derive(Clone)]
+pub struct AgentsView {
+    pub gate: RunGate,
+    pub default_model: Option<ModelName>,
+}
+
+impl AgentsView {
+    /// Assigning needs a repository to work in; a refusal to *run* does not prevent it.
+    pub fn can_assign(&self) -> bool {
+        self.gate != RunGate::NoRepo
+    }
+
+    pub fn notice(&self) -> &'static str {
+        self.gate.notice().unwrap_or("")
+    }
+
+    pub fn model_placeholder(&self) -> String {
+        match &self.default_model {
+            Some(model) => format!("Défaut du projet : {model}"),
+            None => "Défaut du projet".to_owned(),
+        }
+    }
 }
 
 impl AppState {
-    pub fn new(db: Db, loopback_only: bool) -> Self {
+    pub fn new(db: Db, loopback_only: bool, agents: AgentsView) -> Self {
         let (events, _) = broadcast::channel(16);
         Self {
             db,
             events,
             revision: Arc::new(AtomicU64::new(0)),
             loopback_only,
+            agents,
         }
     }
 
@@ -85,14 +115,17 @@ pub fn router(state: AppState) -> Router {
 pub enum AppError {
     NotFound,
     Invalid(String),
+    /// The request is fine but the target is in a state that forbids it.
+    Conflict(String),
     Internal(String),
 }
 
 impl From<StoreError> for AppError {
     fn from(e: StoreError) -> Self {
-        match e {
+        match &e {
             StoreError::NotFound => Self::NotFound,
-            StoreError::Invalid(message) => Self::Invalid(message),
+            StoreError::Invalid(message) => Self::Invalid(message.clone()),
+            StoreError::IllegalTransition { .. } => Self::Conflict(e.to_string()),
             StoreError::Db(e) => Self::Internal(e.to_string()),
         }
     }
@@ -109,6 +142,7 @@ impl IntoResponse for AppError {
         match self {
             Self::NotFound => (StatusCode::NOT_FOUND, "Introuvable.").into_response(),
             Self::Invalid(message) => (StatusCode::UNPROCESSABLE_ENTITY, message).into_response(),
+            Self::Conflict(message) => (StatusCode::CONFLICT, message).into_response(),
             Self::Internal(detail) => {
                 eprintln!("helm: internal error: {detail}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "Erreur interne.").into_response()
@@ -231,6 +265,7 @@ struct CardEditPage {
     board: Board,
     card: Card,
     comments: Vec<Comment>,
+    agents: AgentsView,
 }
 
 #[derive(Template)]
@@ -239,6 +274,7 @@ struct CardPanelFragment {
     board: Board,
     card: Card,
     comments: Vec<Comment>,
+    agents: AgentsView,
 }
 
 #[derive(Template)]
@@ -286,11 +322,13 @@ async fn edit_card(
             ))
         })
         .await?;
+    let agents = state.agents.clone();
     let html = if is_fetch(&headers) {
         CardPanelFragment {
             board,
             card,
             comments,
+            agents,
         }
         .render()?
     } else {
@@ -298,6 +336,7 @@ async fn edit_card(
             board,
             card,
             comments,
+            agents,
         }
         .render()?
     };
@@ -331,6 +370,10 @@ struct CardForm {
     priority: i64,
     #[serde(default)]
     labels: String,
+    #[serde(default)]
+    agent: String,
+    #[serde(default)]
+    model: String,
 }
 
 impl CardForm {
@@ -342,8 +385,25 @@ impl CardForm {
                 description: self.description,
                 priority: self.priority,
                 labels: self.labels,
+                agent: self.agent,
+                model: self.model,
             },
         )
+    }
+}
+
+/// Without a repository there is nowhere for an agent to work, so a card cannot be given one.
+/// Keeping an agent it already has stays allowed: editing the title must not unassign it.
+fn check_assignment(
+    agents: &AgentsView,
+    current: Option<Agent>,
+    requested: &str,
+) -> Result<(), StoreError> {
+    match Agent::parse(requested.trim()) {
+        Some(agent) if !agents.can_assign() && current != Some(agent) => {
+            Err(StoreError::Invalid(agents.notice().to_owned()))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -359,9 +419,13 @@ async fn create_card(
     Form(form): Form<CardForm>,
 ) -> AppResult<Response> {
     let (column_id, input) = form.into_parts();
+    let agents = state.agents.clone();
     state
         .db
-        .call(move |conn| store::create_card(conn, column_id, &input))
+        .call(move |conn| {
+            check_assignment(&agents, None, &input.agent)?;
+            store::create_card(conn, column_id, &input)
+        })
         .await?;
     state.board_changed();
     Ok(written(&headers))
@@ -374,9 +438,14 @@ async fn update_card(
     Form(form): Form<CardForm>,
 ) -> AppResult<Response> {
     let (column_id, input) = form.into_parts();
+    let agents = state.agents.clone();
     state
         .db
-        .call(move |conn| store::update_card(conn, id, column_id, &input))
+        .call(move |conn| {
+            let current = store::get_card(conn, id)?.agent;
+            check_assignment(&agents, current, &input.agent)?;
+            store::update_card(conn, id, column_id, &input)
+        })
         .await?;
     state.board_changed();
     Ok(written(&headers))
@@ -459,8 +528,16 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
+    fn app_with(gate: RunGate) -> Router {
+        let agents = AgentsView {
+            gate,
+            default_model: ModelName::parse_optional("sonnet").unwrap(),
+        };
+        router(AppState::new(Db::open_in_memory().unwrap(), true, agents))
+    }
+
     fn app() -> Router {
-        router(AppState::new(Db::open_in_memory().unwrap(), true))
+        app_with(RunGate::Open)
     }
 
     fn get(uri: &str) -> Request {
@@ -754,6 +831,115 @@ mod tests {
         let text = String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap();
         assert!(text.contains("event: board"), "{text}");
         assert!(text.contains("data: 1"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn the_card_form_assigns_an_agent_and_model_without_script() {
+        let app = app();
+        post_form(&app, "/cards", "column_id=1&title=Task").await;
+
+        let (_, _, page) = send(&app, get("/cards/1/edit")).await;
+        assert!(page.contains("name=\"agent\"") && page.contains("name=\"model\""));
+        assert!(page.contains("Défaut du projet : sonnet"), "{page}");
+        assert!(!page.contains("class=\"notice\""));
+
+        let request = post("/cards/1")
+            .body(Body::from(
+                "column_id=1&title=Task&agent=claude&model=haiku",
+            ))
+            .unwrap();
+        assert_eq!(send(&app, request).await.0, StatusCode::SEE_OTHER);
+
+        let (_, _, page) = send(&app, get("/cards/1/edit")).await;
+        assert!(page.contains("value=\"claude\" selected"), "{page}");
+        assert!(page.contains("value=\"haiku\""));
+        let (_, _, board) = send(&app, get("/board")).await;
+        assert!(board.contains("data-agent=\"claude\""), "{board}");
+
+        assert_eq!(
+            post_form(&app, "/cards/1", "column_id=1&title=Task&agent=codex").await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            post_form(
+                &app,
+                "/cards/1",
+                "column_id=1&title=Task&agent=claude&model=--x"
+            )
+            .await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_repository_agents_cannot_be_assigned_but_an_existing_one_is_kept() {
+        let with_repo = app_with(RunGate::Open);
+        post_form(&with_repo, "/cards", "column_id=1&title=Task&agent=claude").await;
+
+        // Same database, repository removed from the configuration.
+        let state = AppState::new(
+            Db::open_in_memory().unwrap(),
+            true,
+            AgentsView {
+                gate: RunGate::NoRepo,
+                default_model: None,
+            },
+        );
+        let bare = router(state);
+        assert_eq!(
+            post_form(&bare, "/cards", "column_id=1&title=New&agent=claude").await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            post_form(&bare, "/cards", "column_id=1&title=Plain").await,
+            StatusCode::NO_CONTENT
+        );
+        let (_, _, page) = send(&bare, get("/cards/1/edit")).await;
+        assert!(
+            page.contains("class=\"notice\"") && page.contains("project.repo"),
+            "{page}"
+        );
+        assert!(page.contains("id=\"card-agent\"") && page.contains("disabled"));
+    }
+
+    #[tokio::test]
+    async fn a_card_keeps_its_agent_when_edited_while_agents_are_unavailable() {
+        let db = Db::open_in_memory().unwrap();
+        let open = router(AppState::new(
+            db.clone(),
+            true,
+            AgentsView {
+                gate: RunGate::Open,
+                default_model: None,
+            },
+        ));
+        post_form(
+            &open,
+            "/cards",
+            "column_id=1&title=Task&agent=claude&model=haiku",
+        )
+        .await;
+
+        let bare = router(AppState::new(
+            db,
+            true,
+            AgentsView {
+                gate: RunGate::NoRepo,
+                default_model: None,
+            },
+        ));
+        let (_, _, page) = send(&bare, get("/cards/1/edit")).await;
+        assert!(
+            page.contains("type=\"hidden\" name=\"agent\" value=\"claude\""),
+            "{page}"
+        );
+        // The disabled controls are not submitted, so the hidden field carries the agent.
+        assert_eq!(
+            post_form(&bare, "/cards/1", "column_id=1&title=Renamed&agent=claude").await,
+            StatusCode::NO_CONTENT
+        );
+        let (_, _, board) = send(&open, get("/board")).await;
+        assert!(board.contains("Renamed") && board.contains("data-agent=\"claude\""));
     }
 
     const COMMENT: &str =

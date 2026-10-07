@@ -1,10 +1,14 @@
 //! Helm: a self-hosted kanban that will orchestrate coding agents. See `docs/architecture.md`.
 
+mod agent;
 mod assets;
 mod config;
 mod db;
 mod mentions;
 mod routes;
+// Consumed by the supervisor, which arrives later in the same stack.
+#[allow(dead_code)]
+mod runs;
 mod store;
 
 use std::error::Error;
@@ -63,7 +67,11 @@ fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
 }
 
 async fn serve(config: &Config, db: Db) -> Result<(), Box<dyn Error>> {
-    let state = routes::AppState::new(db, config.bind.ip().is_loopback());
+    let agents = routes::AgentsView {
+        gate: config.run_gate(),
+        default_model: config.agents.claude.model.clone(),
+    };
+    let state = routes::AppState::new(db, config.bind.ip().is_loopback(), agents);
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .map_err(|e| format!("cannot listen on {}: {e}", config.bind))?;
@@ -74,6 +82,10 @@ async fn serve(config: &Config, db: Db) -> Result<(), Box<dyn Error>> {
     );
     if !config.bind.ip().is_loopback() {
         eprintln!("helm: warning: not bound to loopback and there is no authentication");
+    }
+    match config.run_gate().notice() {
+        Some(notice) => eprintln!("helm: agents disabled: {notice}"),
+        None => eprintln!("helm: agents enabled"),
     }
     // Open SSE streams never finish on their own, so stop serving as soon as a signal
     // arrives instead of waiting for connections to drain.

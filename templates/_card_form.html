@@ -30,6 +30,31 @@
       </select>
     </div>
   </div>
+  <div class="field-row">
+    <div class="field">
+      <label for="card-agent">Agent</label>
+      {% if !agents.can_assign() && !card.agent_slug().is_empty() %}<input type="hidden" name="agent" value="{{ card.agent_slug() }}">{% endif %}
+      <select class="input" id="card-agent" name="agent" aria-describedby="card-agent-hint"{% if !agents.can_assign() %} disabled{% endif %}>
+        <option value="">Aucun</option>
+        {% for agent in crate::agent::Agent::ALL %}
+        <option value="{{ agent.slug() }}"{% if agent.slug() == card.agent_slug() %} selected{% endif %}>{{ agent.name() }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label for="card-model">Modèle</label>
+      <input class="input" id="card-model" name="model" type="text" list="card-models" autocomplete="off" maxlength="100" aria-describedby="card-agent-hint" placeholder="{{ agents.model_placeholder() }}" value="{{ card.model_text() }}"{% if !agents.can_assign() %} disabled{% endif %}>
+      <datalist id="card-models">
+        <option value="haiku"></option>
+        <option value="sonnet"></option>
+        <option value="opus"></option>
+      </datalist>
+    </div>
+  </div>
+  <p class="field__hint" id="card-agent-hint">L'agent se met au travail quand la carte entre dans une colonne « À faire ». Laissez le modèle vide pour utiliser celui du projet.</p>
+  {% if !agents.notice().is_empty() %}
+  <p class="notice" role="note">{{ agents.notice() }}</p>
+  {% endif %}
   <div class="field">
     <label for="card-labels">Étiquettes</label>
     <input class="input" id="card-labels" name="labels" type="text" autocomplete="off" aria-describedby="card-labels-hint" value="{{ card.labels_text() }}">

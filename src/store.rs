@@ -9,8 +9,10 @@ use std::fmt;
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{Connection, OptionalExtension, Transaction};
 
+use crate::agent::{Agent, ModelName};
 use crate::db::DbError;
 use crate::mentions::{self, Segment};
+use crate::runs::RunStatus;
 
 pub const MAX_TITLE_CHARS: usize = 200;
 pub const MAX_DESCRIPTION_CHARS: usize = 20_000;
@@ -34,6 +36,11 @@ pub enum StoreError {
     NotFound,
     /// The request is well-formed but breaks a rule; the message is shown to the user.
     Invalid(String),
+    /// A run was asked to change state in a way the state machine forbids.
+    IllegalTransition {
+        from: RunStatus,
+        to: RunStatus,
+    },
     Db(DbError),
 }
 
@@ -42,6 +49,9 @@ impl fmt::Display for StoreError {
         match self {
             Self::NotFound => f.write_str("not found"),
             Self::Invalid(message) => f.write_str(message),
+            Self::IllegalTransition { from, to } => {
+                write!(f, "a {} run cannot become {}", from.slug(), to.slug())
+            }
             Self::Db(e) => e.fmt(f),
         }
     }
@@ -61,7 +71,7 @@ impl From<rusqlite::Error> for StoreError {
     }
 }
 
-type Result<T> = std::result::Result<T, StoreError>;
+pub type Result<T> = std::result::Result<T, StoreError>;
 
 fn invalid<T>(message: impl Into<String>) -> Result<T> {
     Err(StoreError::Invalid(message.into()))
@@ -90,6 +100,10 @@ pub struct Card {
     pub priority: i64,
     pub labels: Vec<Label>,
     pub comment_count: i64,
+    /// Who works on the card when it enters a `todo` column; `None` leaves it to humans.
+    pub agent: Option<Agent>,
+    /// The `--model` for that agent; `None` means the project default.
+    pub model: Option<ModelName>,
 }
 
 impl Card {
@@ -111,6 +125,19 @@ impl Card {
 
     pub fn has_priority(&self) -> bool {
         self.priority > 0
+    }
+
+    /// The assigned agent's slug, empty when none: what the form's `<select>` compares with.
+    pub fn agent_slug(&self) -> &'static str {
+        self.agent.map_or("", Agent::slug)
+    }
+
+    pub fn agent_name(&self) -> &'static str {
+        self.agent.map_or("", Agent::name)
+    }
+
+    pub fn model_text(&self) -> &str {
+        self.model.as_ref().map_or("", ModelName::as_str)
     }
 
     /// Labels as the comma-separated text the edit form round-trips.
@@ -142,6 +169,10 @@ pub struct CardInput {
     pub priority: i64,
     /// Comma-separated label names.
     pub labels: String,
+    /// An agent slug, or blank for none.
+    pub agent: String,
+    /// A model name, or blank for the project default. Ignored without an agent.
+    pub model: String,
 }
 
 struct ValidCard {
@@ -149,6 +180,8 @@ struct ValidCard {
     description: String,
     priority: i64,
     labels: Vec<String>,
+    agent: Option<Agent>,
+    model: Option<ModelName>,
 }
 
 impl CardInput {
@@ -173,11 +206,23 @@ impl CardInput {
         {
             return invalid("Priorité inconnue.");
         }
+        let agent = match self.agent.trim() {
+            "" => None,
+            slug => Some(
+                Agent::parse(slug)
+                    .ok_or_else(|| StoreError::Invalid("Agent inconnu.".to_owned()))?,
+            ),
+        };
+        let model = ModelName::parse_optional(&self.model)
+            .map_err(|e| StoreError::Invalid(e.to_string()))?
+            .filter(|_| agent.is_some());
         Ok(ValidCard {
             title: title.to_owned(),
             description: description.to_owned(),
             priority: self.priority,
             labels: parse_labels(&self.labels)?,
+            agent,
+            model,
         })
     }
 }
@@ -256,7 +301,7 @@ pub fn load_board(conn: &Connection) -> Result<Board> {
     let cards: Vec<Card> = conn
         .prepare(
             "SELECT id, column_id, number, title, description, priority,
-                    (SELECT COUNT(*) FROM comments WHERE card_id = cards.id)
+                    (SELECT COUNT(*) FROM comments WHERE card_id = cards.id), agent, model
              FROM cards
              WHERE project_id = ?1 ORDER BY column_id, position, id",
         )?
@@ -281,7 +326,7 @@ pub fn get_card(conn: &Connection, id: i64) -> Result<Card> {
     let mut card = conn
         .query_row(
             "SELECT id, column_id, number, title, description, priority,
-                    (SELECT COUNT(*) FROM comments WHERE card_id = cards.id)
+                    (SELECT COUNT(*) FROM comments WHERE card_id = cards.id), agent, model
              FROM cards
              WHERE id = ?1",
             [id],
@@ -305,6 +350,8 @@ fn card_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Card> {
         priority: row.get(5)?,
         labels: Vec::new(),
         comment_count: row.get(6)?,
+        agent: row.get(7)?,
+        model: row.get(8)?,
     })
 }
 
@@ -354,8 +401,8 @@ pub fn create_card(conn: &mut Connection, column_id: i64, input: &CardInput) -> 
         |row| row.get(0),
     )?;
     tx.execute(
-        "INSERT INTO cards (project_id, column_id, number, title, description, priority, position)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO cards (project_id, column_id, number, title, description, priority, position, agent, model)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         (
             project_id,
             column_id,
@@ -364,6 +411,8 @@ pub fn create_card(conn: &mut Connection, column_id: i64, input: &CardInput) -> 
             &card.description,
             card.priority,
             position,
+            card.agent,
+            &card.model,
         ),
     )?;
     let id = tx.last_insert_rowid();
@@ -383,9 +432,17 @@ pub fn update_card(
     let tx = conn.transaction()?;
     let (project_id, current_column) = card_location(&tx, id)?;
     tx.execute(
-        "UPDATE cards SET title = ?1, description = ?2, priority = ?3, updated_at = unixepoch()
-         WHERE id = ?4",
-        (&card.title, &card.description, card.priority, id),
+        "UPDATE cards SET title = ?1, description = ?2, priority = ?3, agent = ?4, model = ?5,
+                updated_at = unixepoch()
+         WHERE id = ?6",
+        (
+            &card.title,
+            &card.description,
+            card.priority,
+            card.agent,
+            &card.model,
+            id,
+        ),
     )?;
     set_labels(&tx, project_id, id, &card.labels)?;
     if column_id != current_column {
@@ -407,6 +464,16 @@ pub fn move_card(conn: &mut Connection, id: i64, column_id: i64, index: usize) -
 pub fn delete_card(conn: &mut Connection, id: i64) -> Result<()> {
     let tx = conn.transaction()?;
     let (project_id, column_id) = card_location(&tx, id)?;
+    let active_run: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM agent_runs WHERE card_id = ?1 AND status IN ('queued', 'running'))",
+        [id],
+        |row| row.get(0),
+    )?;
+    if active_run {
+        return invalid(
+            "Une exécution d'agent est en cours : annulez-la avant de supprimer la carte.",
+        );
+    }
     tx.execute("DELETE FROM cards WHERE id = ?1", [id])?;
     let remaining = column_card_ids(&tx, column_id, id)?;
     renumber(&tx, column_id, &remaining)?;
@@ -741,6 +808,63 @@ mod tests {
         assert_eq!(get_card(&conn, second).unwrap().number, 2);
     }
 
+    fn assigned(agent: &str, model: &str) -> CardInput {
+        CardInput {
+            title: "Task".to_owned(),
+            agent: agent.to_owned(),
+            model: model.to_owned(),
+            ..CardInput::default()
+        }
+    }
+
+    #[test]
+    fn an_agent_and_model_assignment_round_trips_and_can_be_changed() {
+        let mut conn = test_conn();
+        let id = create_card(&mut conn, 1, &assigned("claude", " haiku ")).unwrap();
+        let card = get_card(&conn, id).unwrap();
+        assert_eq!(card.agent, Some(Agent::Claude));
+        assert_eq!(card.model_text(), "haiku");
+        assert_eq!(layout_agents(&conn), [Some(Agent::Claude)]);
+
+        update_card(&mut conn, id, 1, &assigned("claude", "")).unwrap();
+        let card = get_card(&conn, id).unwrap();
+        assert_eq!((card.agent, card.model), (Some(Agent::Claude), None));
+
+        update_card(&mut conn, id, 1, &assigned("", "opus")).unwrap();
+        let card = get_card(&conn, id).unwrap();
+        assert_eq!(
+            (card.agent, card.model),
+            (None, None),
+            "a model without an agent is dropped"
+        );
+    }
+
+    fn layout_agents(conn: &Connection) -> Vec<Option<Agent>> {
+        load_board(conn)
+            .unwrap()
+            .columns
+            .into_iter()
+            .flat_map(|column| column.cards)
+            .map(|card| card.agent)
+            .collect()
+    }
+
+    #[test]
+    fn unknown_agents_and_unsafe_model_names_are_rejected_without_writing() {
+        let mut conn = test_conn();
+        for (agent, model) in [
+            ("codex", ""),
+            ("claude", "--dangerously-skip-permissions"),
+            ("claude", "a b"),
+        ] {
+            assert!(matches!(
+                create_card(&mut conn, 1, &assigned(agent, model)),
+                Err(StoreError::Invalid(_))
+            ));
+        }
+        assert!(layout_agents(&conn).is_empty());
+    }
+
     #[test]
     fn moving_within_a_column_reorders_it() {
         let mut conn = test_conn();
@@ -812,6 +936,7 @@ mod tests {
             description: "line 1\r\nline 2  \n".to_owned(),
             priority: 4,
             labels: "bug, UI".to_owned(),
+            ..CardInput::default()
         };
         update_card(&mut conn, id, columns[4], &edited).unwrap();
 
