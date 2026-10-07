@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}{{ board.project.name }} · Helm{% endblock %}
+{% block content %}
+<h1 class="visually-hidden">Tableau {{ board.project.name }}</h1>
+{% include "_board.html" %}
+<p class="shortcuts" id="shortcuts" hidden>
+  <kbd>←</kbd><kbd>↑</kbd><kbd>↓</kbd><kbd>→</kbd> naviguer
+  <span aria-hidden="true">·</span> <kbd>Alt</kbd> + flèches déplacer la carte
+  <span aria-hidden="true">·</span> <kbd>Entrée</kbd> ouvrir
+  <span aria-hidden="true">·</span> <kbd>N</kbd> nouvelle carte
+</p>
+<div class="visually-hidden" id="live-region" role="status" aria-live="polite"></div>
+<dialog class="dialog" id="card-dialog" aria-labelledby="card-form-title">
+  <div id="card-dialog-body"></div>
+</dialog>
+{% endblock %}

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>{% block title %}Helm{% endblock %}</title>
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/tokens.css">
+  <link rel="stylesheet" href="/assets/app.css">
+  <script src="/assets/theme.js"></script>
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Aller au contenu</a>
+  <header class="topbar">
+    <a class="topbar__brand" href="/">Helm</a>
+    <span class="topbar__project">{{ board.project.name }}</span>
+    <span class="topbar__spacer"></span>
+    <span class="status" id="connection-status" data-state="idle" hidden>
+      <span class="status__dot" aria-hidden="true"></span>
+      <span class="status__text" id="connection-text"></span>
+    </span>
+    <button class="button button--quiet" type="button" id="theme-toggle" hidden></button>
+  </header>
+  <main id="main" tabindex="-1">
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

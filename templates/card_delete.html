@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Supprimer {{ board.project.key }}-{{ card.number }} · Helm{% endblock %}
+{% block content %}
+<div class="page">
+  <form class="form" method="post" action="/cards/{{ card.id }}/delete">
+    <h2 class="form__title">
+      <span class="card__key">{{ board.project.key }}-{{ card.number }}</span>
+      Supprimer la carte
+    </h2>
+    <p>La carte « {{ card.title }} » sera supprimée définitivement.</p>
+    <div class="form__actions">
+      <button class="button button--danger" type="submit">Supprimer définitivement</button>
+      <a class="button" href="/cards/{{ card.id }}/edit">Annuler</a>
+    </div>
+  </form>
+</div>
+{% endblock %}

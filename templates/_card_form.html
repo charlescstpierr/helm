@@ -1,0 +1,44 @@
+<form class="form" method="post" action="/cards/{{ card.id }}" data-async>
+  <h2 class="form__title" id="card-form-title">
+    <span class="card__key">{{ board.project.key }}-{{ card.number }}</span>
+    Modifier la carte
+  </h2>
+  <p class="form__error" role="alert" hidden></p>
+  <div class="field">
+    <label for="card-title">Titre</label>
+    <input class="input" id="card-title" name="title" type="text" required maxlength="200" autocomplete="off" value="{{ card.title }}">
+  </div>
+  <div class="field">
+    <label for="card-description">Description</label>
+    <textarea class="input" id="card-description" name="description" rows="6" maxlength="20000">{{ card.description }}</textarea>
+  </div>
+  <div class="field-row">
+    <div class="field">
+      <label for="card-column">Colonne</label>
+      <select class="input" id="card-column" name="column_id">
+        {% for column in board.columns %}
+        <option value="{{ column.id }}"{% if column.id == card.column_id %} selected{% endif %}>{{ column.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label for="card-priority">Priorité</label>
+      <select class="input" id="card-priority" name="priority">
+        {% for priority in crate::store::PRIORITIES %}
+        <option value="{{ priority.0 }}"{% if priority.0 == card.priority %} selected{% endif %}>{{ priority.2 }}</option>
+        {% endfor %}
+      </select>
+    </div>
+  </div>
+  <div class="field">
+    <label for="card-labels">Étiquettes</label>
+    <input class="input" id="card-labels" name="labels" type="text" autocomplete="off" aria-describedby="card-labels-hint" value="{{ card.labels_text() }}">
+    <p class="field__hint" id="card-labels-hint">Séparées par des virgules, dix au maximum.</p>
+  </div>
+  <div class="form__actions">
+    <button class="button button--primary" type="submit">Enregistrer</button>
+    <a class="button" href="/" data-close-dialog>Annuler</a>
+    <span class="form__spacer"></span>
+    <a class="button button--danger" href="/cards/{{ card.id }}/delete" data-delete-card data-confirm="Supprimer définitivement cette carte ?">Supprimer</a>
+  </div>
+</form>
