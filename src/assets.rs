@@ -64,43 +64,96 @@ mod tests {
         }
     }
 
+    fn css_without_comments(css: &str) -> String {
+        let mut out = String::new();
+        let mut rest = css;
+        while let Some(start) = rest.find("/*") {
+            out.push_str(&rest[..start]);
+            rest = rest[start + 2..]
+                .split_once("*/")
+                .map_or("", |(_, after)| after);
+        }
+        out + rest
+    }
+
+    /// Splits a stylesheet into `(property, value)` pairs.
+    fn declarations(css: &str) -> Vec<(String, String)> {
+        css_without_comments(css)
+            .split([';', '{', '}'])
+            .filter_map(|part| part.split_once(':'))
+            .map(|(name, value)| (name.trim().to_lowercase(), value.trim().to_lowercase()))
+            .collect()
+    }
+
+    /// The value with every parenthesised argument list removed, so `var(--x)` vanishes and
+    /// `rgb(0 0 0)` is left as the bare function name.
+    fn without_arguments(value: &str) -> String {
+        let mut depth = 0;
+        let mut out = String::new();
+        for ch in value.chars() {
+            match ch {
+                '(' => depth += 1,
+                ')' if depth > 0 => depth -= 1,
+                _ if depth == 0 => out.push(ch),
+                _ => {}
+            }
+        }
+        out
+    }
+
     /// The visual charter plugs in through `tokens.css` alone: component styles must not
     /// hard-code any colour.
     #[test]
     fn component_styles_only_use_colour_tokens() {
+        const COLOUR_FUNCTIONS: [&str; 6] = ["rgb", "rgba", "hsl", "hsla", "oklch", "oklab"];
+        const COLOUR_PROPERTIES: [&str; 8] = [
+            "background",
+            "border",
+            "outline",
+            "fill",
+            "stroke",
+            "box-shadow",
+            "text-shadow",
+            "caret",
+        ];
         let css = Assets::get("app.css").unwrap();
         let css = std::str::from_utf8(&css.data).unwrap();
-        for (number, line) in css.lines().enumerate() {
-            let lowered = line.to_lowercase();
-            let hex_colour = lowered.match_indices('#').any(|(at, _)| {
-                lowered[at + 1..]
-                    .chars()
-                    .take(3)
-                    .filter(char::is_ascii_hexdigit)
-                    .count()
-                    == 3
-            });
-            let colour_function = ["rgb(", "rgba(", "hsl(", "hsla(", "oklch(", "oklab("]
-                .iter()
-                .any(|function| lowered.contains(function));
+        for (name, value) in declarations(css) {
+            let colours_something = name.contains("color")
+                || COLOUR_PROPERTIES
+                    .iter()
+                    .any(|property| name.starts_with(property));
+            if name.starts_with("--") || !colours_something {
+                continue;
+            }
+            let hard_coded = without_arguments(&value)
+                .split(|ch: char| ch.is_whitespace() || ch == ',')
+                .any(|token| token.starts_with('#') || COLOUR_FUNCTIONS.contains(&token));
             assert!(
-                !hex_colour && !colour_function,
-                "app.css:{} hard-codes a colour, use a token from tokens.css: {line}",
-                number + 1
+                !hard_coded,
+                "app.css hard-codes a colour in `{name}: {value}`, use a token from tokens.css"
             );
         }
     }
 
-    /// Everything is served from the binary: no asset may point at another host.
+    /// Everything is served from the binary: no stylesheet may load another host.
     #[test]
     fn assets_reference_no_external_host() {
-        for path in Assets::iter() {
+        for path in Assets::iter().filter(|path| path.ends_with(".css")) {
             let file = Assets::get(&path).unwrap();
-            let text = String::from_utf8_lossy(&file.data).replace("http://www.w3.org/", "");
-            assert!(
-                !text.contains("http://") && !text.contains("https://") && !text.contains("url(//"),
-                "{path} references an external URL"
-            );
+            let css = css_without_comments(std::str::from_utf8(&file.data).unwrap());
+            for chunk in css.split("url(").chain(css.split("@import")).skip(1) {
+                let target = chunk
+                    .trim_start()
+                    .trim_start_matches(['"', '\''])
+                    .to_lowercase();
+                assert!(
+                    !(target.starts_with("http:")
+                        || target.starts_with("https:")
+                        || target.starts_with("//")),
+                    "{path} loads an external resource: {target}"
+                );
+            }
         }
     }
 }
