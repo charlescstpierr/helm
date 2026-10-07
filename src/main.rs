@@ -3,6 +3,7 @@
 mod assets;
 mod config;
 mod db;
+mod mentions;
 mod routes;
 mod store;
 

@@ -1,0 +1,16 @@
+{% include "_card_form.html" %}
+<section class="comments" aria-labelledby="comments-title">
+  <h3 class="comments__title" id="comments-title">Commentaires</h3>
+  {% include "_thread.html" %}
+  <form class="comment-form" method="post" action="/cards/{{ card.id }}/comments" data-comment-form>
+    <p class="form__error" role="alert" hidden></p>
+    <div class="field">
+      <label for="comment-body">Nouveau commentaire</label>
+      <textarea class="input" id="comment-body" name="body" rows="3" required maxlength="20000" aria-describedby="comment-body-hint"></textarea>
+      <p class="field__hint" id="comment-body-hint">Mentionnez <span class="mention" data-target="claude">@claude</span>, <span class="mention" data-target="codex">@codex</span> ou <span class="mention" data-target="moi">@moi</span> pour leur adresser le commentaire.</p>
+    </div>
+    <div class="form__actions">
+      <button class="button button--primary" type="submit">Commenter</button>
+    </div>
+  </form>
+</section>

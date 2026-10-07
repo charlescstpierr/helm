@@ -55,6 +55,8 @@
   /* How much of the slot colour tints a label's background */
   --label-tint: 14%;
 
+  --mention-tint: 16%;
+
   /* Typography */
   --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -98,6 +100,7 @@
   --card-accent-width: 3px;
   --control-height: 2.25rem;
   --dot-size: 0.5rem;
+  --icon-size: 0.875rem;
 
   /* Motion */
   --duration-fast: 120ms;
