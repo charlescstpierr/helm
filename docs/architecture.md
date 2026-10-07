@@ -46,7 +46,7 @@ navigateur ──HTTP──▶ axum (routes.rs) ──▶ store.rs ──▶ SQL
 ### Choix techniques
 
 - **Axum sur Tokio**, fonctionnalités réduites au nécessaire (`http1`, `form`). Runtime
-  `current_thread` quand `worker_threads = 1` (défaut), multi-thread sinon.
+  `current_thread`.
 - **rusqlite (SQLite compilé avec le binaire)** plutôt que sqlx : pas de pool ni de runtime de
   requêtes asynchrone à payer. Une seule connexion derrière un mutex, utilisée depuis le pool
   bloquant de Tokio (plafonné à 2 threads). Pour un utilisateur, sérialiser les écritures est

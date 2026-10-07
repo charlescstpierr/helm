@@ -28,7 +28,6 @@ Tout est optionnel. Ordre de priorité : variables d'environnement, puis fichier
 | --------------------- | --------------------- | ---------------- | ---------------------------------------------- |
 | `bind`                | `HELM_BIND`           | `127.0.0.1:7878` | Adresse d'écoute.                              |
 | `db_path`             | `HELM_DB`             | `helm.db`        | Fichier SQLite (mode WAL).                     |
-| `worker_threads`      | `HELM_WORKER_THREADS` | `1`              | Threads Tokio ; `1` = runtime mono-thread.     |
 
 Le fichier lu est `helm.toml` dans le répertoire courant s'il existe, ou celui désigné par
 `HELM_CONFIG`. Modèle : [helm.example.toml](helm.example.toml).

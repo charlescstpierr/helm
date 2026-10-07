@@ -1,11 +1,8 @@
 # Copy to `helm.toml` (or point HELM_CONFIG at it). Every key is optional.
-# Environment variables win over this file: HELM_BIND, HELM_DB, HELM_WORKER_THREADS.
+# Environment variables win over this file: HELM_BIND, HELM_DB.
 
 # Address to listen on. Keep it on loopback unless you put a trusted proxy/VPN in front.
 bind = "127.0.0.1:7878"
 
 # SQLite database file (created on first start, WAL mode).
 db_path = "helm.db"
-
-# Tokio worker threads. 1 = single-threaded runtime (lowest memory).
-worker_threads = 1

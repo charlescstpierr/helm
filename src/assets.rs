@@ -85,22 +85,6 @@ mod tests {
             .collect()
     }
 
-    /// The value with every parenthesised argument list removed, so `var(--x)` vanishes and
-    /// `rgb(0 0 0)` is left as the bare function name.
-    fn without_arguments(value: &str) -> String {
-        let mut depth = 0;
-        let mut out = String::new();
-        for ch in value.chars() {
-            match ch {
-                '(' => depth += 1,
-                ')' if depth > 0 => depth -= 1,
-                _ if depth == 0 => out.push(ch),
-                _ => {}
-            }
-        }
-        out
-    }
-
     /// The visual charter plugs in through `tokens.css` alone: component styles must not
     /// hard-code any colour.
     #[test]
@@ -123,11 +107,11 @@ mod tests {
                 || COLOUR_PROPERTIES
                     .iter()
                     .any(|property| name.starts_with(property));
-            if name.starts_with("--") || !colours_something {
+            if !name.starts_with("--") && !colours_something {
                 continue;
             }
-            let hard_coded = without_arguments(&value)
-                .split(|ch: char| ch.is_whitespace() || ch == ',')
+            let hard_coded = value
+                .split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | '(' | ')'))
                 .any(|token| token.starts_with('#') || COLOUR_FUNCTIONS.contains(&token));
             assert!(
                 !hard_coded,
@@ -141,12 +125,13 @@ mod tests {
     fn assets_reference_no_external_host() {
         for path in Assets::iter().filter(|path| path.ends_with(".css")) {
             let file = Assets::get(&path).unwrap();
-            let css = css_without_comments(std::str::from_utf8(&file.data).unwrap());
-            for chunk in css.split("url(").chain(css.split("@import")).skip(1) {
-                let target = chunk
-                    .trim_start()
-                    .trim_start_matches(['"', '\''])
-                    .to_lowercase();
+            let css = css_without_comments(std::str::from_utf8(&file.data).unwrap()).to_lowercase();
+            let targets = css
+                .split("url(")
+                .skip(1)
+                .chain(css.split("@import").skip(1));
+            for chunk in targets {
+                let target = chunk.trim_start().trim_start_matches(['"', '\'']);
                 assert!(
                     !(target.starts_with("http:")
                         || target.starts_with("https:")

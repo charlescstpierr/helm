@@ -186,8 +186,8 @@ textarea {
 }
 
 .button--quiet {
-  border-color: transparent;
-  background: transparent;
+  border-color: var(--color-quiet-border);
+  background: var(--color-quiet-bg);
   color: var(--color-text-muted);
 }
 
@@ -247,7 +247,7 @@ textarea.input {
 .column__title {
   font-size: var(--font-size-sm);
   font-weight: var(--font-weight-bold);
-  letter-spacing: 0.02em;
+  letter-spacing: var(--letter-spacing-heading);
 }
 
 .column__count {
@@ -425,7 +425,7 @@ kbd {
 
 .dialog {
   width: min(var(--dialog-width), calc(100% - var(--space-6)));
-  padding: var(--space-5);
+  padding: 0;
   border: var(--border-width) solid var(--color-border);
   border-radius: var(--radius-lg);
   background: var(--color-surface);
@@ -435,6 +435,10 @@ kbd {
 
 .dialog::backdrop {
   background: var(--color-backdrop);
+}
+
+#card-dialog-body {
+  padding: var(--space-5);
 }
 
 .page {

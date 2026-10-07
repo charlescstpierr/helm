@@ -19,6 +19,8 @@
   --color-surface-hover: light-dark(#f0f1f4, #232731);
   --color-border: light-dark(#d5d9e0, #2e3440);
   --color-border-strong: light-dark(#aab1bd, #4a5262);
+  --color-quiet-bg: transparent;
+  --color-quiet-border: transparent;
   --color-backdrop: light-dark(#11131866, #000000a6);
 
   /* Text */
@@ -56,6 +58,7 @@
   --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   --font-size-xs: 0.75rem;
+  --letter-spacing-heading: 0.02em;
   --font-size-sm: 0.8125rem;
   --font-size-md: 0.9375rem;
   --font-size-lg: 1.125rem;

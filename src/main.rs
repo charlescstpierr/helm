@@ -16,7 +16,7 @@ const USAGE: &str = "\
 Usage: helm [--help | --version]
 
 Configuration comes from `helm.toml` (or the file named by HELM_CONFIG) and from the
-HELM_BIND, HELM_DB and HELM_WORKER_THREADS environment variables. See README.md.";
+HELM_BIND and HELM_DB environment variables. See README.md.";
 
 fn main() -> ExitCode {
     match std::env::args().nth(1).as_deref() {
@@ -46,23 +46,19 @@ fn main() -> ExitCode {
 fn run() -> Result<(), Box<dyn Error>> {
     let config = Config::load()?;
     let db = Db::open(&config.db_path)?;
-    let runtime = build_runtime(config.worker_threads)?;
+    let runtime = build_runtime()?;
     let served = runtime.block_on(serve(&config, db.clone()));
     db.checkpoint();
     served
 }
 
-/// A deliberately small runtime: one worker by default, and a blocking pool no larger than
-/// the single SQLite connection can use.
-fn build_runtime(worker_threads: usize) -> std::io::Result<tokio::runtime::Runtime> {
-    let mut builder = if worker_threads <= 1 {
-        tokio::runtime::Builder::new_current_thread()
-    } else {
-        let mut builder = tokio::runtime::Builder::new_multi_thread();
-        builder.worker_threads(worker_threads);
-        builder
-    };
-    builder.max_blocking_threads(2).enable_all().build()
+/// A deliberately small runtime: a single thread, and a blocking pool no larger than the
+/// single SQLite connection can use.
+fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(2)
+        .enable_all()
+        .build()
 }
 
 async fn serve(config: &Config, db: Db) -> Result<(), Box<dyn Error>> {
