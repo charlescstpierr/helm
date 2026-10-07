@@ -57,7 +57,7 @@ navigateur ──HTTP──▶ axum (routes.rs) ──▶ store.rs ──▶ SQL
 - **Migrations** : liste ordonnée dans `db.rs`, table `schema_migrations`, une transaction par
   migration. Une migration publiée ne se modifie jamais. Une base plus récente que le binaire
   est refusée au démarrage plutôt que corrompue.
-- **Pas de framework front.** Environ 350 lignes de JavaScript sans dépendance : glisser-déposer
+- **Pas de framework front.** Environ 400 lignes de JavaScript sans dépendance : glisser-déposer
   HTML5, raccourcis clavier, dialogue d'édition, `EventSource`. Rien n'est chargé depuis un
   CDN ; la CSP est `default-src 'self'`.
 
@@ -114,8 +114,8 @@ projects 1──* board_columns 1──* cards *──* labels
   Colonnes par défaut : Backlog, À faire, En cours, En revue, Terminé.
 - **`cards`** — `id` (`AUTOINCREMENT` : jamais réattribué, un formulaire resté ouvert sur une
   carte supprimée ne peut donc pas en atteindre une autre), `number` (séquentiel par projet,
-  jamais réutilisé : `HELM-12`), `title`,
-  `description`, `priority`, `column_id`, `position`, horodatages Unix.
+  jamais réutilisé : `HELM-12`), `title`, `description`, `priority`, `column_id`, `position`,
+  horodatages Unix.
   - **Ordre** : `position` est un rang dense (0, 1, 2…) dans la colonne, renuméroté dans la
     même transaction à chaque déplacement ou suppression. Simple, sans dérive, et le coût
     (quelques dizaines de lignes) est sans importance ici.
