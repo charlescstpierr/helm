@@ -299,11 +299,18 @@
     if (deleteLink) {
       // Without this script the link leads to a server-rendered confirmation page.
       event.preventDefault();
-      if (!confirm(deleteLink.dataset.confirm)) return;
+      if (deleteLink.dataset.submitting || !confirm(deleteLink.dataset.confirm)) return;
+      const errorBox = dialogBody.querySelector('.form__error');
+      errorBox.hidden = true;
+      deleteLink.dataset.submitting = 'true';
       try {
         await post(deleteLink.href, '');
       } catch (error) {
-        announce(`Suppression impossible : ${error.message}`);
+        errorBox.textContent = `Suppression impossible : ${error.message}`;
+        errorBox.hidden = false;
+        return;
+      } finally {
+        delete deleteLink.dataset.submitting;
       }
       dialog.close();
       refresh();
