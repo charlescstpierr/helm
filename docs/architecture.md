@@ -12,7 +12,7 @@ Ce document décrit ce qui existe (v0.1 : le kanban) et la conception de ce qui 
 
 - **Un seul binaire, une seule base.** Un crate Rust, un fichier SQLite, les assets web
   embarqués. Pas de Node, pas d'étape de build front, pas de service annexe.
-- **Léger d'abord.** Runtime Tokio à un seul thread par défaut, une seule connexion SQLite,
+- **Léger d'abord.** Runtime Tokio à un seul thread, une seule connexion SQLite,
   aucun cache applicatif. La RAM au repos est un objectif mesuré, pas une intention.
 - **Local par défaut.** Écoute sur `127.0.0.1`, pas d'authentification : la frontière de
   sécurité est la machine.

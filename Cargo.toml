@@ -13,7 +13,7 @@ futures-util = { version = "0.3", default-features = false }
 rusqlite = { version = "0.40", features = ["bundled"] }
 rust-embed = "8"
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "signal", "macros", "time"] }
+tokio = { version = "1", features = ["rt", "net", "sync", "signal", "macros", "time"] }
 toml = { version = "1", default-features = false, features = ["parse", "serde"] }
 
 [dev-dependencies]

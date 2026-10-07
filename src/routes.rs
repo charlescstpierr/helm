@@ -143,7 +143,7 @@ async fn guard(State(state): State<AppState>, request: Request, next: Next) -> R
     );
     headers.insert(
         header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
+        HeaderValue::from_static("same-origin"),
     );
     response
 }
@@ -533,6 +533,9 @@ mod tests {
             .body(Body::from(body))
             .unwrap();
         assert_eq!(send(&app, cross_site).await.0, StatusCode::FORBIDDEN);
+
+        let (_, headers, _) = send(&app, get("/")).await;
+        assert_eq!(headers[header::REFERRER_POLICY], "same-origin");
 
         let same_origin = post("/cards")
             .header(header::ORIGIN, "http://localhost:7878")

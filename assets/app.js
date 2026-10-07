@@ -289,11 +289,16 @@
     dialogBody.querySelector('input[name="title"]')?.focus();
   });
 
+  let pressedOnBackdrop = false;
+  dialog.addEventListener('mousedown', (event) => {
+    pressedOnBackdrop = event.target === dialog;
+  });
+
   dialog.addEventListener('click', (event) => {
     if (event.target.closest('[data-close-dialog]')) {
       event.preventDefault();
       dialog.close();
-    } else if (event.target === dialog) {
+    } else if (event.target === dialog && pressedOnBackdrop) {
       // A click on the backdrop lands on the <dialog> element itself.
       dialog.close();
     }
