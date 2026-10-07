@@ -83,6 +83,11 @@ impl Config {
             .or(file.db_path)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_DB_PATH));
 
+        // SQLite treats an empty filename as a throwaway temporary database.
+        if db_path.as_os_str().is_empty() {
+            return Err(ConfigError("db_path must not be empty".to_owned()));
+        }
+
         Ok(Self { bind, db_path })
     }
 }
@@ -124,6 +129,7 @@ mod tests {
     fn rejects_invalid_values() {
         assert!(Config::resolve(Some("bind = \"nowhere\""), no_env).is_err());
         assert!(Config::resolve(Some("unknown_key = 1"), no_env).is_err());
+        assert!(Config::resolve(Some("db_path = \"\""), no_env).is_err());
     }
 
     #[test]

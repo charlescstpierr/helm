@@ -39,7 +39,6 @@
     <button class="button button--primary" type="submit">Enregistrer</button>
     <a class="button" href="/" data-close-dialog>Annuler</a>
     <span class="form__spacer"></span>
-    <button class="button button--danger" type="submit" form="card-delete-form">Supprimer</button>
+    <a class="button button--danger" href="/cards/{{ card.id }}/delete" data-delete-card data-confirm="Supprimer définitivement cette carte ?">Supprimer</a>
   </div>
 </form>
-<form id="card-delete-form" method="post" action="/cards/{{ card.id }}/delete" data-async data-confirm="Supprimer définitivement cette carte ?"></form>

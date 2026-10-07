@@ -21,8 +21,10 @@ CREATE TABLE board_columns (
 
 -- `position` is a dense 0-based rank inside the column, renumbered on every move.
 -- `priority`: 0 none, 1 low, 2 medium, 3 high, 4 urgent.
+-- AUTOINCREMENT: a deleted card's id is never handed to a later card, so a stale form or
+-- link can only ever hit a 404, not somebody else's card.
 CREATE TABLE cards (
-    id          INTEGER PRIMARY KEY,
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id  INTEGER NOT NULL REFERENCES projects (id) ON DELETE CASCADE,
     column_id   INTEGER NOT NULL REFERENCES board_columns (id) ON DELETE RESTRICT,
     number      INTEGER NOT NULL,
@@ -41,9 +43,11 @@ CREATE INDEX cards_by_column ON cards (column_id, position);
 CREATE TABLE labels (
     id         INTEGER PRIMARY KEY,
     project_id INTEGER NOT NULL REFERENCES projects (id) ON DELETE CASCADE,
-    name       TEXT    NOT NULL COLLATE NOCASE,
+    name       TEXT    NOT NULL,
+    -- Unicode-lowercased name: SQLite's NOCASE only folds ASCII.
+    name_key   TEXT    NOT NULL,
     color_slot INTEGER NOT NULL DEFAULT 0 CHECK (color_slot BETWEEN 0 AND 7),
-    UNIQUE (project_id, name)
+    UNIQUE (project_id, name_key)
 ) STRICT;
 
 CREATE TABLE card_labels (

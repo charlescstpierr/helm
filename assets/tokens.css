@@ -37,6 +37,7 @@
   --color-success: light-dark(#1f7a4d, #6fd3a0);
 
   /* Priorities */
+  --priority-none: transparent;
   --priority-low: light-dark(#5b6472, #9aa3b2);
   --priority-medium: light-dark(#2f5bd7, #8aa9ff);
   --priority-high: light-dark(#b25e00, #ffb454);

@@ -294,8 +294,20 @@
     pressedOnBackdrop = event.target === dialog;
   });
 
-  dialog.addEventListener('click', (event) => {
-    if (event.target.closest('[data-close-dialog]')) {
+  dialog.addEventListener('click', async (event) => {
+    const deleteLink = event.target.closest('[data-delete-card]');
+    if (deleteLink) {
+      // Without this script the link leads to a server-rendered confirmation page.
+      event.preventDefault();
+      if (!confirm(deleteLink.dataset.confirm)) return;
+      try {
+        await post(deleteLink.href, '');
+      } catch (error) {
+        announce(`Suppression impossible : ${error.message}`);
+      }
+      dialog.close();
+      refresh();
+    } else if (event.target.closest('[data-close-dialog]')) {
       event.preventDefault();
       dialog.close();
     } else if (event.target === dialog && pressedOnBackdrop) {
@@ -315,11 +327,15 @@
     const form = event.target;
     if (!form.matches('form[data-async]')) return;
     event.preventDefault();
-    if (form.dataset.confirm && !confirm(form.dataset.confirm)) return;
+    // A second submit while the first is in flight would create a duplicate.
+    if (form.dataset.submitting) return;
 
     const inDialog = dialog.contains(form);
     const errorBox = (inDialog ? dialogBody : form).querySelector('.form__error');
     if (errorBox) errorBox.hidden = true;
+    const title = form.querySelector('input[name="title"]');
+    const sentTitle = title.value;
+    form.dataset.submitting = 'true';
     try {
       await post(form.action, new URLSearchParams(new FormData(form)));
     } catch (error) {
@@ -330,13 +346,15 @@
         announce(error.message);
       }
       return;
+    } finally {
+      delete form.dataset.submitting;
     }
     if (inDialog) {
       dialog.close();
     } else {
-      const title = form.querySelector('input[name="title"]');
-      announce(`Carte « ${title.value.trim()} » ajoutée.`);
-      form.reset();
+      announce(`Carte « ${sentTitle.trim()} » ajoutée.`);
+      // Keep whatever was typed while the request was in flight.
+      if (title.value === sentTitle) form.reset();
       title.focus();
     }
     refresh();
@@ -351,16 +369,11 @@
   }
 
   const events = new EventSource('/events');
-  let wasOffline = false;
   events.addEventListener('open', () => {
     setConnection('live', 'En direct');
-    // Changes made while disconnected were not announced.
-    if (wasOffline) refresh();
-    wasOffline = false;
+    // Nothing is replayed: catch up on writes made before this connection was established.
+    refresh();
   });
-  events.addEventListener('error', () => {
-    setConnection('offline', 'Hors ligne');
-    wasOffline = true;
-  });
+  events.addEventListener('error', () => setConnection('offline', 'Hors ligne'));
   events.addEventListener('board', refresh);
 })();

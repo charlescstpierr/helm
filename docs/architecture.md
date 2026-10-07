@@ -112,7 +112,9 @@ projects 1──* board_columns 1──* cards *──* labels
   et **`category`** : `backlog`, `todo`, `in_progress`, `in_review`, `done`. La catégorie est
   le statut stable sur lequel l'orchestrateur raisonnera ; le nom n'est que de l'affichage.
   Colonnes par défaut : Backlog, À faire, En cours, En revue, Terminé.
-- **`cards`** — `number` (séquentiel par projet, jamais réutilisé : `HELM-12`), `title`,
+- **`cards`** — `id` (`AUTOINCREMENT` : jamais réattribué, un formulaire resté ouvert sur une
+  carte supprimée ne peut donc pas en atteindre une autre), `number` (séquentiel par projet,
+  jamais réutilisé : `HELM-12`), `title`,
   `description`, `priority`, `column_id`, `position`, horodatages Unix.
   - **Ordre** : `position` est un rang dense (0, 1, 2…) dans la colonne, renuméroté dans la
     même transaction à chaque déplacement ou suppression. Simple, sans dérive, et le coût
@@ -170,7 +172,7 @@ projects 1──* board_columns 1──* cards *──* labels
 dialogue d'édition (description, priorité, étiquettes, colonne) et se déplace librement :
 glisser-déposer, `Alt` + flèches au clavier, ou liste « Colonne » du formulaire. Aucune
 transition n'est interdite — c'est l'outil d'une seule personne. La suppression est définitive
-(confirmation dans le dialogue).
+(confirmation dans le dialogue, ou page de confirmation sans JavaScript).
 
 **Prévu, avec l'orchestrateur.** Les colonnes gardent leur liberté pour l'humain, mais leur
 catégorie déclenche et reflète le travail des agents :

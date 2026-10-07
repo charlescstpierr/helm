@@ -64,7 +64,10 @@ pub fn router(state: AppState) -> Router {
         .route("/cards/{id}", post(update_card))
         .route("/cards/{id}/edit", get(edit_card))
         .route("/cards/{id}/move", post(move_card))
-        .route("/cards/{id}/delete", post(delete_card))
+        .route(
+            "/cards/{id}/delete",
+            get(confirm_delete_card).post(delete_card),
+        )
         .route("/events", get(events))
         .route("/assets/{*path}", get(assets::serve))
         .route("/healthz", get(|| async { "ok" }))
@@ -212,6 +215,13 @@ struct BoardFragment {
 }
 
 #[derive(Template)]
+#[template(path = "card_delete.html")]
+struct CardDeletePage {
+    board: Board,
+    card: Card,
+}
+
+#[derive(Template)]
 #[template(path = "card_edit.html")]
 struct CardEditPage {
     board: Board,
@@ -233,6 +243,20 @@ async fn board_page(State(state): State<AppState>) -> AppResult<Html<String>> {
 async fn board_fragment(State(state): State<AppState>) -> AppResult<Html<String>> {
     let board = state.db.call(|conn| store::load_board(conn)).await?;
     Ok(Html(BoardFragment { board }.render()?))
+}
+
+/// Confirmation step for deleting without JavaScript (the script asks in a dialog instead).
+async fn confirm_delete_card(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> AppResult<Html<String>> {
+    let (board, card) = state
+        .db
+        .call(move |conn| {
+            Ok::<_, StoreError>((store::load_board(conn)?, store::get_card(conn, id)?))
+        })
+        .await?;
+    Ok(Html(CardDeletePage { board, card }.render()?))
 }
 
 async fn edit_card(
@@ -482,6 +506,49 @@ mod tests {
         );
         let (_, _, board) = send(&app, get("/board")).await;
         assert!(!board.contains("Shipped") && board.contains("Second"));
+    }
+
+    #[tokio::test]
+    async fn stale_routes_never_reach_a_card_created_after_a_deletion() {
+        let app = app();
+        post_form(&app, "/cards", "column_id=1&title=Old").await;
+        assert_eq!(
+            post_form(&app, "/cards/1/delete", "").await,
+            StatusCode::NO_CONTENT
+        );
+        post_form(&app, "/cards", "column_id=1&title=New").await;
+
+        // A form left open on the deleted card must not edit or delete the new one.
+        assert_eq!(
+            post_form(&app, "/cards/1", "column_id=1&title=Hijacked").await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            post_form(&app, "/cards/1/delete", "").await,
+            StatusCode::NOT_FOUND
+        );
+        let (_, _, board) = send(&app, get("/board")).await;
+        assert!(board.contains("New") && !board.contains("Hijacked"));
+    }
+
+    #[tokio::test]
+    async fn deleting_without_script_goes_through_a_confirmation_page() {
+        let app = app();
+        post_form(&app, "/cards", "column_id=1&title=Keep+me").await;
+
+        // The edit page links to the confirmation page instead of deleting on click.
+        let (_, _, edit) = send(&app, get("/cards/1/edit")).await;
+        assert!(edit.contains("href=\"/cards/1/delete\""));
+        let (status, _, confirm) = send(&app, get("/cards/1/delete")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(confirm.contains("Keep me") && confirm.contains("method=\"post\""));
+        let (_, _, board) = send(&app, get("/board")).await;
+        assert!(board.contains("Keep me"));
+
+        assert_eq!(
+            send(&app, get("/cards/42/delete")).await.0,
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[tokio::test]

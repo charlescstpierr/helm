@@ -188,14 +188,16 @@ pub fn parse_labels(text: &str) -> Result<Vec<String>> {
             ));
         }
         let lowered = name.to_lowercase();
-        if !labels.iter().any(|known| known.to_lowercase() == lowered) {
-            labels.push(name.to_owned());
+        if labels.iter().any(|known| known.to_lowercase() == lowered) {
+            continue;
         }
-    }
-    if labels.len() > MAX_LABELS_PER_CARD {
-        return invalid(format!(
-            "Pas plus de {MAX_LABELS_PER_CARD} étiquettes par carte."
-        ));
+        // Checked as we go so an oversized list is rejected without being fully scanned.
+        if labels.len() == MAX_LABELS_PER_CARD {
+            return invalid(format!(
+                "Pas plus de {MAX_LABELS_PER_CARD} étiquettes par carte."
+            ));
+        }
+        labels.push(name.to_owned());
     }
     Ok(labels)
 }
@@ -306,7 +308,7 @@ fn labels_by_card(conn: &Connection, filter: &str, param: i64) -> Result<HashMap
          JOIN labels l ON l.id = cl.label_id
          JOIN cards c ON c.id = cl.card_id
          WHERE {filter}
-         ORDER BY l.name"
+         ORDER BY l.name_key"
     ))?;
     let rows = statement.query_map([param], |row| {
         Ok((
@@ -471,15 +473,16 @@ fn place_card(
 fn set_labels(tx: &Transaction<'_>, project_id: i64, card_id: i64, names: &[String]) -> Result<()> {
     tx.execute("DELETE FROM card_labels WHERE card_id = ?1", [card_id])?;
     for name in names {
+        let key = name.to_lowercase();
         tx.execute(
-            "INSERT INTO labels (project_id, name, color_slot) VALUES (?1, ?2, ?3)
-             ON CONFLICT (project_id, name) DO NOTHING",
-            (project_id, name, color_slot(name)),
+            "INSERT INTO labels (project_id, name, name_key, color_slot) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (project_id, name_key) DO NOTHING",
+            (project_id, name, &key, color_slot(name)),
         )?;
         tx.execute(
             "INSERT INTO card_labels (card_id, label_id)
-             SELECT ?1, id FROM labels WHERE project_id = ?2 AND name = ?3",
-            (card_id, project_id, name),
+             SELECT ?1, id FROM labels WHERE project_id = ?2 AND name_key = ?3",
+            (card_id, project_id, &key),
         )?;
     }
     prune_labels(tx, project_id)
@@ -706,6 +709,41 @@ mod tests {
         assert_eq!(label_count(&conn), 1);
         update_card(&mut conn, b, column, &input("B")).unwrap();
         assert_eq!(label_count(&conn), 0);
+    }
+
+    #[test]
+    fn accented_labels_are_shared_across_cards() {
+        let mut conn = test_conn();
+        let column = column_ids(&conn)[0];
+        let mut first = input("A");
+        first.labels = "Équipe".to_owned();
+        let a = create_card(&mut conn, column, &first).unwrap();
+        let mut second = input("B");
+        second.labels = "équipe".to_owned();
+        let b = create_card(&mut conn, column, &second).unwrap();
+
+        assert_eq!(
+            get_card(&conn, a).unwrap().labels,
+            get_card(&conn, b).unwrap().labels
+        );
+        assert_eq!(get_card(&conn, b).unwrap().labels_text(), "Équipe");
+    }
+
+    #[test]
+    fn card_ids_are_never_reused_after_deletion() {
+        let mut conn = test_conn();
+        let column = column_ids(&conn)[0];
+        let first = create_card(&mut conn, column, &input("first")).unwrap();
+        delete_card(&mut conn, first).unwrap();
+        let second = create_card(&mut conn, column, &input("second")).unwrap();
+
+        assert_ne!(first, second);
+        assert!(matches!(get_card(&conn, first), Err(StoreError::NotFound)));
+        assert!(matches!(
+            delete_card(&mut conn, first),
+            Err(StoreError::NotFound)
+        ));
+        assert_eq!(layout(&conn)[0], ["second"]);
     }
 
     #[test]
