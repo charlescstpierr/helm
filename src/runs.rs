@@ -9,7 +9,7 @@ use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, 
 use rusqlite::{Connection, OptionalExtension, Row, Transaction};
 
 use crate::agent::{Agent, ModelName, PermissionMode};
-use crate::store::{Result, StoreError};
+use crate::store::{self, Result, StoreError};
 
 /// Identifies a run; kept apart from card and event ids, which are also plain integers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -168,6 +168,20 @@ pub enum EventKind {
 }
 
 impl EventKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Init => "Session",
+            Self::Message => "Agent",
+            Self::ToolUse => "Outil",
+            Self::ToolResult => "Résultat",
+            Self::Result => "Fin",
+            Self::System => "Système",
+            Self::Notice => "Helm",
+            Self::Error => "Erreur",
+            Self::Malformed => "Illisible",
+        }
+    }
+
     pub const ALL: [Self; 9] = [
         Self::Init,
         Self::Message,
@@ -229,6 +243,43 @@ pub struct RunEvent {
     pub created_at: i64,
 }
 
+impl RunEvent {
+    pub fn time_iso(&self) -> String {
+        store::utc_iso(self.created_at)
+    }
+
+    pub fn time_display(&self) -> String {
+        store::utc_time_display(self.created_at)
+    }
+}
+
+/// How many of the latest events a card shows; the log itself keeps them all.
+pub const ACTIVITY_EVENT_LIMIT: i64 = 200;
+
+/// What the card's activity panel shows: the latest run and the tail of its log.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Activity {
+    pub run: Option<Run>,
+    /// Oldest first, without CLI bookkeeping.
+    pub events: Vec<RunEvent>,
+    /// Events of the run in total, shown or not.
+    pub total_events: i64,
+    /// Database time when this was read, so a running run's duration is current.
+    pub now: i64,
+}
+
+impl Activity {
+    pub fn duration_display(&self) -> String {
+        self.run
+            .as_ref()
+            .map_or(String::new(), |run| run.duration_display(self.now))
+    }
+
+    pub fn hidden_events(&self) -> i64 {
+        self.total_events - self.events.len() as i64
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Run {
     pub id: RunId,
@@ -252,6 +303,33 @@ pub struct Run {
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
     pub pushed_at: Option<i64>,
+}
+
+impl Run {
+    pub fn cost_display(&self) -> String {
+        self.cost_usd.map_or(String::new(), |cost| {
+            format!("{cost:.4} $").replace('.', ",")
+        })
+    }
+
+    pub fn tokens_display(&self) -> String {
+        match (self.tokens_in, self.tokens_out) {
+            (Some(tokens_in), Some(tokens_out)) => format!("{tokens_in} → {tokens_out}"),
+            _ => String::new(),
+        }
+    }
+
+    /// How long the run took so far, or in total once it is over.
+    pub fn duration_display(&self, now: i64) -> String {
+        let Some(started) = self.started_at else {
+            return String::new();
+        };
+        let seconds = (self.finished_at.unwrap_or(now) - started).max(0);
+        match seconds {
+            0..=59 => format!("{seconds} s"),
+            _ => format!("{} min {:02} s", seconds / 60, seconds % 60),
+        }
+    }
 }
 
 const RUN_COLUMNS: &str = "id, card_id, agent, model, permission_mode, status, prompt, session_id,
@@ -500,14 +578,15 @@ pub fn append_event(conn: &Connection, run: RunId, event: &NewEvent) -> Result<i
     )?)
 }
 
-/// The run's events in order.
-pub fn list_events(conn: &Connection, run: RunId) -> Result<Vec<RunEvent>> {
-    Ok(conn
+/// The run's events in order. `System` bookkeeping is left out and only the latest `limit`
+/// are returned.
+pub fn list_events(conn: &Connection, run: RunId, limit: i64) -> Result<Vec<RunEvent>> {
+    let mut events: Vec<RunEvent> = conn
         .prepare(
             "SELECT seq, kind, summary, created_at FROM agent_events
-             WHERE run_id = ?1 ORDER BY seq",
+             WHERE run_id = ?1 AND kind <> 'system' ORDER BY seq DESC LIMIT ?2",
         )?
-        .query_map([run], |row| {
+        .query_map((run, limit), |row| {
             Ok(RunEvent {
                 seq: row.get(0)?,
                 kind: row.get(1)?,
@@ -515,7 +594,33 @@ pub fn list_events(conn: &Connection, run: RunId) -> Result<Vec<RunEvent>> {
                 created_at: row.get(3)?,
             })
         })?
-        .collect::<rusqlite::Result<_>>()?)
+        .collect::<rusqlite::Result<_>>()?;
+    events.reverse();
+    Ok(events)
+}
+
+pub fn activity(conn: &Connection, card_id: i64) -> Result<Activity> {
+    let now = conn.query_row("SELECT unixepoch()", [], |row| row.get(0))?;
+    let Some(run) = latest_run(conn, card_id)? else {
+        return Ok(Activity {
+            run: None,
+            events: Vec::new(),
+            total_events: 0,
+            now,
+        });
+    };
+    let events = list_events(conn, run.id, ACTIVITY_EVENT_LIMIT)?;
+    let total_events = conn.query_row(
+        "SELECT COUNT(*) FROM agent_events WHERE run_id = ?1",
+        [run.id],
+        |row| row.get(0),
+    )?;
+    Ok(Activity {
+        run: Some(run),
+        events,
+        total_events,
+        now,
+    })
 }
 
 #[cfg(test)]
@@ -789,7 +894,7 @@ mod tests {
             2
         );
 
-        let events = list_events(&conn, second).unwrap();
+        let events = list_events(&conn, second, 100).unwrap();
         let seen: Vec<(i64, EventKind, &str)> = events
             .iter()
             .map(|e| (e.seq, e.kind, e.summary.as_str()))
@@ -798,7 +903,7 @@ mod tests {
             seen,
             [(1, EventKind::Init, "b"), (2, EventKind::ToolUse, "c")]
         );
-        assert_eq!(list_events(&conn, first).unwrap().len(), 1);
+        assert_eq!(list_events(&conn, first, 100).unwrap().len(), 1);
     }
 
     #[test]

@@ -59,9 +59,9 @@ Dans le formulaire d'une carte, choisissez l'agent (Claude) et, si besoin, un mo
 de `agents.claude.model`, sinon celui du CLI). Quand la carte **entre** dans une colonne « À
 faire », une exécution est mise en file : Helm crée le worktree `<racine>/<CLÉ>-<n>` sur la
 branche `helm/<CLÉ>-<n>`, lance `claude -p` dedans (mode `bypassPermissions` par défaut), garde
-chaque événement du flux sur la carte, puis pousse la branche vers `origin`. Succès : la carte
+chaque événement du flux (affiché en direct dans « Activité de l'agent » : statut, branche, session, coût, jetons, journal, sortie d'erreur, consigne), puis pousse la branche vers `origin`. Succès : la carte
 passe en « En revue ». Échec (agent, absence de commit, push refusé) : elle reste « En cours » et
-l'erreur est ajoutée au fil de la carte. Aucune PR n'est ouverte et les worktrees ne sont pas nettoyés.
+l'erreur est affichée sur la carte et ajoutée à son fil. Aucune PR n'est ouverte et les worktrees ne sont pas nettoyés.
 Une exécution en cours peut être annulée depuis la carte ; si Helm s'arrête pendant une
 exécution, celle-ci est marquée « interrompue » au redémarrage et n'est jamais relancée seule.
 

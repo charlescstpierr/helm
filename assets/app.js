@@ -301,6 +301,57 @@
     }
   }
 
+  let activityRequest = 0;
+
+  const activityElement = () => dialogBody.querySelector('#run-activity');
+
+  // The activity panel is replaced as a whole; the card form beside it is never touched, so a
+  // draft in progress survives the agent's stream of events.
+  async function refreshActivity() {
+    const current = activityElement();
+    if (!dialog.open || !current || !lastOpenedCardId) return;
+    const request = ++activityRequest;
+    try {
+      const response = await fetch(`/cards/${lastOpenedCardId}/activity`, { headers: FETCH_HEADERS });
+      if (!response.ok || request !== activityRequest) return;
+      const template = document.createElement('template');
+      template.innerHTML = await response.text();
+      const next = template.content.getElementById('run-activity');
+      const live = activityElement();
+      if (!next || !live) return;
+      const events = live.querySelector('.activity__events');
+      const followTail = !events || events.scrollTop + events.clientHeight >= events.scrollHeight - 24;
+      const openDetails = [...live.querySelectorAll('details[open]')].map((d) => d.querySelector('summary').textContent);
+      live.replaceWith(next);
+      for (const details of next.querySelectorAll('details')) {
+        if (openDetails.includes(details.querySelector('summary').textContent)) details.open = true;
+      }
+      // Localised times change line wrapping, so scroll only once the layout is final.
+      localizeTimes(next);
+      const nextEvents = next.querySelector('.activity__events');
+      if (nextEvents && followTail) nextEvents.scrollTop = nextEvents.scrollHeight;
+    } catch {
+      // Offline: the SSE reconnection triggers another refresh.
+    }
+  }
+
+  dialog.addEventListener('submit', async (event) => {
+    const form = event.target;
+    if (!form.matches('form[data-run-form]')) return;
+    event.preventDefault();
+    if (form.dataset.submitting) return;
+    form.dataset.submitting = 'true';
+    try {
+      await post(form.action, new URLSearchParams());
+    } catch (error) {
+      announce(`Annulation impossible : ${error.message}`);
+    } finally {
+      delete form.dataset.submitting;
+    }
+    refreshActivity();
+    refresh();
+  });
+
   dialog.addEventListener('keydown', (event) => {
     if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && event.target.matches('#comment-body')) {
       event.preventDefault();
@@ -352,6 +403,8 @@
     lastOpenedCardId = link.closest('.card').dataset.cardId;
     dialog.showModal();
     localizeTimes(dialogBody);
+    const firstEvents = dialogBody.querySelector('.activity__events');
+    if (firstEvents) firstEvents.scrollTop = firstEvents.scrollHeight;
     dialogBody.querySelector('input[name="title"]')?.focus();
   });
 
@@ -447,10 +500,12 @@
     // Nothing is replayed: catch up on writes made before this connection was established.
     refresh();
     refreshThread();
+    refreshActivity();
   });
   events.addEventListener('error', () => setConnection('offline', 'Hors ligne'));
   events.addEventListener('board', () => {
     refresh();
     refreshThread();
+    refreshActivity();
   });
 })();
