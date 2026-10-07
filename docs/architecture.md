@@ -5,8 +5,8 @@ Helm est un tableau kanban auto-hébergé pour un développeur solo, dans l'espr
 des CLI (`claude -p`, `codex exec`) ; le tableau est à la fois l'outil de suivi et le bus par
 lequel ils se coordonnent.
 
-Ce document décrit ce qui existe (v0.1 : le kanban) et la conception de ce qui vient
-(l'orchestrateur). Chaque section précise son état : **livré** ou **prévu**.
+Ce document décrit ce qui existe (le kanban et ses commentaires) et la conception de ce qui
+vient (l'orchestrateur). Chaque section précise son état : **livré** ou **prévu**.
 
 ## 1. Principes
 
@@ -36,7 +36,8 @@ navigateur ──HTTP──▶ axum (routes.rs) ──▶ store.rs ──▶ SQL
 | `main.rs`       | Arguments, construction du runtime, écoute, arrêt propre.                   |
 | `config.rs`     | Valeurs par défaut → fichier TOML → variables d'environnement.              |
 | `db.rs`         | Connexion SQLite, pragmas, migrations embarquées, pont vers le pool bloquant. |
-| `store.rs`      | Modèle du tableau et opérations sur les cartes (synchrone, testé seul).     |
+| `store.rs`      | Modèle du tableau, opérations sur les cartes et les commentaires (synchrone, testé seul). |
+| `mentions.rs`   | Reconnaissance des `@mentions` : cibles connues et scanner pur.             |
 | `routes.rs`     | Pages, formulaires, flux SSE, garde-fous de requête.                        |
 | `assets.rs`     | Fichiers statiques embarqués (`rust-embed`), revalidés par ETag.            |
 | `templates/`    | Gabarits Askama compilés dans le binaire.                                   |
@@ -83,6 +84,10 @@ Chaque écriture réussie incrémente une révision et la publie sur un canal `b
 le fragment `GET /board` et remplace les listes de cartes. Un onglet en retard ou reconnecté
 converge donc toujours, au prix d'un rendu complet du tableau — négligeable à cette échelle.
 
+Un commentaire publie le même événement : le compteur de la carte se met à jour avec le
+tableau, et le dialogue ouvert recharge seulement le fil (`GET /cards/{id}/comments`), jamais le
+formulaire, pour ne pas écraser un brouillon en cours de saisie.
+
 ### Sécurité du mode local
 
 Sans authentification, tout ce qui atteint le port peut modifier le tableau. Deux garde-fous
@@ -99,11 +104,12 @@ des agents (voir les décisions ouvertes).
 
 ## 3. Modèle de données
 
-### Livré (migration `0001_init`)
+### Livré (migrations `0001_init` et `0002_comments`)
 
 ```
 projects 1──* board_columns 1──* cards *──* labels
-                                   (card_labels)
+                                   │      (card_labels)
+                                   └──1──* comments 1──* mentions
 ```
 
 - **`projects`** — `key` (préfixe des identifiants, ex. `HELM`), `name`,
@@ -125,15 +131,25 @@ projects 1──* board_columns 1──* cards *──* labels
   (0–7) désigne une variable CSS `--label-N` : la base ne stocke aucune couleur, la charte
   reste maîtresse du rendu.
 
+- **`comments`** — `card_id` (suppression en cascade avec la carte), `author_kind`
+  (`human` | `agent` | `system`, contraint en base), `author` (nom affiché : `moi`, `claude`,
+  `codex`…), `body` (source Markdown, affiché en texte brut échappé, retours à la ligne
+  conservés), `created_at`. Le fil d'une carte est lu par `id` croissant. Il n'y a ni édition
+  ni suppression d'un commentaire.
+- **`mentions`** — `comment_id` (cascade), `target`, `handled_at`. Extraites dans la même
+  transaction que le commentaire, une ligne par cible distincte. L'ensemble des cibles est
+  fermé et vit dans `src/mentions.rs` (`@claude`, `@codex`, `@moi`) : `@param` ou une adresse
+  électronique (`nom@codex.com`) ne crée aucune mention, car personne ne la traiterait. La base
+  ne contraint pas `target`, pour qu'ajouter un agent n'exige pas de reconstruire la table.
+  `handled_at` reste `NULL` tant que l'orchestrateur n'a pas agi ; l'index partiel
+  `mentions_unhandled (target, comment_id) WHERE handled_at IS NULL` fait de « ce qui attend
+  l'agent X, le plus ancien d'abord » une seule requête sur l'index. Rien ne consomme encore
+  les mentions : le fil les met seulement en évidence.
+
 ### Prévu (migrations suivantes)
 
 - **`cards.parent_id`** — sous-cartes : un agent découpe son travail ou délègue en créant des
   cartes filles.
-- **`comments`** — `card_id`, `author_kind` (`human` | `agent` | `system`), `author`
-  (nom d'agent ou d'utilisateur), `body` (Markdown), `created_at`. Les **mentions**
-  (`@claude`, `@codex`, `@moi`) sont extraites à l'écriture dans **`mentions`**
-  (`comment_id`, `target`, `handled_at`) pour que l'orchestrateur trouve en une requête ce qui
-  attend une réponse.
 - **`agent_runs`** (exécutions d'agent) — une ligne par lancement d'un agent sur une carte :
 
   | Colonne           | Sens                                                               |
@@ -171,7 +187,8 @@ projects 1──* board_columns 1──* cards *──* labels
 **Livré.** Une carte naît en bas d'une colonne (ajout rapide, titre seul), s'enrichit dans le
 dialogue d'édition (description, priorité, étiquettes, colonne) et se déplace librement :
 glisser-déposer, `Alt` + flèches au clavier, ou liste « Colonne » du formulaire. Aucune
-transition n'est interdite — c'est l'outil d'une seule personne. La suppression est définitive
+transition n'est interdite — c'est l'outil d'une seule personne. Le dialogue d'édition porte
+aussi le fil de commentaires de la carte et un formulaire pour en ajouter (auteur `moi`). La suppression est définitive
 (confirmation dans le dialogue, ou page de confirmation sans JavaScript).
 
 **Prévu, avec l'orchestrateur.** Les colonnes gardent leur liberté pour l'humain, mais leur
@@ -236,7 +253,8 @@ Un agent n'écrit **jamais** dans le terminal ni dans l'entrée standard d'un au
 coordination passe par des objets du tableau, visibles et historisés :
 
 - **Commentaires** — un agent rend compte, pose une question, laisse une note de passation.
-- **Mentions** — `@codex` dans un commentaire crée une mention non traitée ; l'orchestrateur
+  Le stockage et l'affichage sont livrés (section 3) ; seul l'humain écrit pour l'instant.
+- **Mentions** — `@codex` dans un commentaire crée une mention non traitée (livré) ; l'orchestrateur
   la transforme en exécution (ou en reprise) de l'agent visé, sur cette carte, avec le fil de
   commentaires comme contexte. `@moi` bloque la carte en attente de l'humain.
 - **Sous-cartes** — pour déléguer, un agent crée une carte fille ; elle suit son propre cycle
@@ -259,8 +277,9 @@ conversation, et remplacer un agent par un autre ne change pas le protocole.
 - **Clavier.** Flèches pour naviguer entre cartes et colonnes, `Alt` + flèches pour déplacer,
   `Entrée` pour ouvrir, `N` pour une nouvelle carte, `Échap` pour fermer. Focus toujours
   visible (`:focus-visible`), lien d'évitement, région `aria-live` annonçant les déplacements.
-- **Sans JavaScript**, créer, modifier, déplacer (liste « Colonne ») et supprimer restent
-  possibles par envoi de formulaire classique.
+- **Sans JavaScript**, créer, modifier, déplacer (liste « Colonne »), supprimer et commenter
+  restent possibles par envoi de formulaire classique. Les heures des commentaires sont alors
+  affichées en UTC ; le script les convertit dans le fuseau du navigateur.
 
 ## 7. Décisions ouvertes
 
