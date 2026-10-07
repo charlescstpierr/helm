@@ -2,6 +2,9 @@
 {% block title %}{{ board.project.name }} · Helm{% endblock %}
 {% block content %}
 <h1 class="visually-hidden">Tableau {{ board.project.name }}</h1>
+{% if !agents.banner().is_empty() %}
+<p class="notice notice--danger" role="alert">{{ agents.banner() }}</p>
+{% endif %}
 {% include "_board.html" %}
 <p class="shortcuts" id="shortcuts" hidden>
   <kbd>←</kbd><kbd>↑</kbd><kbd>↓</kbd><kbd>→</kbd> naviguer
