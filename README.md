@@ -33,8 +33,8 @@ Tout est optionnel. Ordre de priorité : variables d'environnement, puis fichier
 | --------------------- | --------------------- | ---------------- | ---------------------------------------------- |
 | `bind`                | `HELM_BIND`           | `127.0.0.1:7878` | Adresse d'écoute.                              |
 | `db_path`             | `HELM_DB`             | `helm.db`        | Fichier SQLite (mode WAL).                     |
-| `project.repo`        |                       | aucun            | Dépôt git des cartes. Sans lui, pas d'agents.  |
-| `project.worktree_root` |                     | `~/.local/share/helm/worktrees` | Un worktree par carte : `<racine>/<CLÉ>-<n>`. |
+| `project.repo`        |                       | aucun            | Dépôt git des cartes (chemin absolu ou `~/…`). Sans lui, pas d'agents. |
+| `project.worktree_root` |                     | `~/.local/share/helm/worktrees` | Un worktree par carte : `<racine>/<CLÉ>-<n>` (chemin absolu ou `~/…`). |
 | `agents.max_concurrent` |                     | `2`              | Exécutions simultanées au plus.                |
 | `agents.run_timeout_minutes` |                | `60`             | Durée maximale d'un agent ; au-delà il est arrêté et l'exécution échoue. |
 | `agents.claude.command` |                     | `claude`         | Exécutable de Claude Code.                     |

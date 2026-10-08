@@ -12,7 +12,7 @@ db_path = "helm.db"
 # Runs also need a loopback `bind`: Helm has no authentication, and a run executes code.
 #
 # [project]
-# repo = "~/code/my-project"                          # git repository cards are worked on in
+# repo = "~/code/my-project"                          # git repository cards are worked on in; absolute or ~/…
 # worktree_root = "~/.local/share/helm/worktrees"     # one worktree per card: <root>/<KEY>-<n>
 #
 # [agents]

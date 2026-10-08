@@ -201,6 +201,8 @@ impl Config {
                         "project.repo and project.worktree_root must not be empty".to_owned(),
                     ));
                 }
+                require_absolute("project.repo", &repo)?;
+                require_absolute("project.worktree_root", &worktree_root)?;
                 Some(ProjectConfig {
                     repo,
                     worktree_root,
@@ -266,6 +268,18 @@ impl Config {
             RunGate::Open
         }
     }
+}
+
+/// Git resolves a relative path against the repository and Helm against its own working
+/// directory, so a relative one would name two different places.
+fn require_absolute(key: &str, path: &Path) -> Result<(), ConfigError> {
+    if path.is_absolute() {
+        return Ok(());
+    }
+    Err(ConfigError(format!(
+        "{key} must be an absolute path (got `{}`); write the full path or start it with `~/`",
+        path.display()
+    )))
 }
 
 /// Expands a leading `~` or `~/`; the shell does not do it for a path read from a file.
@@ -396,11 +410,38 @@ mod tests {
             "[agents.claude]\nmodel = \"--oops\"",
             "[agents.claude]\ncommand = \"\"",
             "[project]\nrepo = \"\"",
+            "[project]\nrepo = \"code/app\"",
+            "[project]\nrepo = \"./app\"",
+            "[project]\nrepo = \"/r\"\nworktree_root = \"worktrees\"",
+            "[project]\nrepo = \"/r\"\nworktree_root = \"../wt\"",
             "[project]\nbranch = \"main\"",
             "[project]\nworktree_root = \"/srv/wt\"",
         ] {
             assert!(Config::resolve(Some(bad), home_env).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_relative_repo_or_worktree_root_names_the_key_and_the_value() {
+        let relative_root = "[project]\nrepo = \"/r\"\nworktree_root = \"wt/cards\"";
+        let message = Config::resolve(Some(relative_root), home_env)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("project.worktree_root")
+                && message.contains("wt/cards")
+                && message.contains("absolute"),
+            "{message}"
+        );
+        let message = Config::resolve(Some("[project]\nrepo = \"code/app\""), home_env)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("project.repo") && message.contains("code/app"),
+            "{message}"
+        );
+        let relative_home = |key: &str| (key == "HOME").then(|| "home/dev".to_owned());
+        assert!(Config::resolve(Some("[project]\nrepo = \"/r\""), relative_home).is_err());
     }
 
     #[test]
