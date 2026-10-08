@@ -120,9 +120,31 @@ pub fn branch_name(key: &str, number: i64) -> String {
     format!("helm/{key}-{number}")
 }
 
+async fn canonicalize(path: &Path) -> Result<PathBuf> {
+    tokio::fs::canonicalize(path)
+        .await
+        .map_err(|e| GitError(format!("cannot resolve {}: {e}", path.display())))
+}
+
+async fn belongs_to_repository(repo: &Path, path: &Path) -> Result<bool> {
+    // Git also discovers repositories in parent directories. The card directory must
+    // itself be the checkout root, not just a directory inside a matching checkout.
+    let top_level = git(path, &["rev-parse", "--show-toplevel"]).await?;
+    if canonicalize(Path::new(&top_level)).await? != canonicalize(path).await? {
+        return Ok(false);
+    }
+
+    // Branch names alone do not identify a repository. Linked worktrees share the
+    // same common git directory; an unrelated checkout does not.
+    let common_dir = git(path, &["rev-parse", "--git-common-dir"]).await?;
+    let repo_common_dir = git(repo, &["rev-parse", "--git-common-dir"]).await?;
+    Ok(canonicalize(&path.join(common_dir)).await?
+        == canonicalize(&repo.join(repo_common_dir)).await?)
+}
+
 /// Makes sure the card has its worktree and returns it. Safe to repeat: an existing worktree
-/// on the card's branch is reused, an existing branch without a worktree is checked out
-/// again, and stale worktree records are pruned first.
+/// from this repository on the card's branch is reused, an existing branch without a
+/// worktree is checked out again, and stale worktree records are pruned first.
 pub async fn prepare_worktree(
     repo: &Path,
     root: &Path,
@@ -137,16 +159,25 @@ pub async fn prepare_worktree(
         return error(format!("project key {key:?} cannot name a directory"));
     }
     let branch = branch_name(key, number);
-    let path = root.join(format!("{key}-{number}"));
     tokio::fs::create_dir_all(root)
         .await
         .map_err(|e| GitError(format!("cannot create {}: {e}", root.display())))?;
+    // `git -C repo` resolves relative arguments from the repository, while this root
+    // is configured relative to Helm's working directory.
+    let path = std::path::absolute(root)
+        .map_err(|e| GitError(format!("cannot resolve {}: {e}", root.display())))?
+        .join(format!("{key}-{number}"));
 
     git(repo, &["worktree", "prune"]).await?;
     if path.exists() {
         let head = git(&path, &["symbolic-ref", "--short", "HEAD"]).await;
         return match head {
-            Ok(current) if current == branch => Ok(Worktree { path, branch }),
+            Ok(current)
+                if current == branch
+                    && belongs_to_repository(repo, &path).await.unwrap_or(false) =>
+            {
+                Ok(Worktree { path, branch })
+            }
             _ => error(format!(
                 "{} exists but is not the worktree of branch {branch}",
                 path.display()
@@ -348,6 +379,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_relative_worktree_root_is_resolved_from_the_process_directory() {
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let remote = Remote::new("git-relative-root");
+        let root =
+            PathBuf::from("target").join(format!("helm-relative-worktrees-{}", std::process::id()));
+        let _cleanup = Cleanup(root.clone());
+        let expected = std::env::current_dir().unwrap().join(&root).join("HELM-1");
+        let wt = prepare_worktree(&remote.repo, &root, "HELM", 1)
+            .await
+            .unwrap();
+
+        assert!(
+            expected.join("README.md").exists(),
+            "{}",
+            expected.display()
+        );
+        assert_eq!(wt.path, expected);
+        assert_eq!(
+            prepare_worktree(&remote.repo, &root, "HELM", 1)
+                .await
+                .unwrap(),
+            wt
+        );
+    }
+
+    #[tokio::test]
     async fn preparing_twice_reuses_the_worktree_and_a_deleted_one_is_recreated_on_its_branch() {
         let remote = Remote::new("git-idempotent");
         let first = prepare_worktree(&remote.repo, &remote.worktrees, "HELM", 1)
@@ -484,6 +547,53 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("cannot name a directory"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_worktree_from_another_repository_with_the_same_branch_is_refused() {
+        let remote = Remote::new("git-refuse-foreign");
+        let other = Remote::new("git-foreign");
+        let path = remote.worktrees.join("HELM-1");
+        run(
+            &other.repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "helm/HELM-1",
+                path.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(path.join("keep.txt"), "untouched").unwrap();
+
+        let err = prepare_worktree(&remote.repo, &remote.worktrees, "HELM", 1)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("is not the worktree"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(path.join("keep.txt")).unwrap(),
+            "untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_subdirectory_of_the_matching_repository_and_branch_is_refused() {
+        let remote = Remote::new("git-refuse-nested");
+        run(&remote.repo, &["checkout", "-q", "-b", "helm/HELM-1"]);
+        let path = remote.repo.join("HELM-1");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("keep.txt"), "untouched").unwrap();
+
+        let err = prepare_worktree(&remote.repo, &remote.repo, "HELM", 1)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("is not the worktree"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(path.join("keep.txt")).unwrap(),
+            "untouched"
+        );
     }
 
     #[tokio::test]

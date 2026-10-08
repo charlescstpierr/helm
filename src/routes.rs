@@ -980,7 +980,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_card_keeps_its_agent_when_edited_while_agents_are_unavailable() {
+    async fn a_card_keeps_its_assignment_when_edited_while_agents_are_unavailable() {
         let db = Db::open_in_memory().unwrap();
         let open = router(AppState::new(db.clone(), true, orchestrator(RunGate::Open)));
         post_form(
@@ -990,19 +990,34 @@ mod tests {
         )
         .await;
 
-        let bare = router(AppState::new(db, true, orchestrator(RunGate::NoRepo)));
+        let bare = router(AppState::new(
+            db.clone(),
+            true,
+            orchestrator(RunGate::NoRepo),
+        ));
         let (_, _, page) = send(&bare, get("/cards/1/edit")).await;
         assert!(
             page.contains("type=\"hidden\" name=\"agent\" value=\"claude\""),
             "{page}"
         );
-        // The disabled controls are not submitted, so the hidden field carries the agent.
+        assert!(
+            page.contains("type=\"hidden\" name=\"model\" value=\"haiku\""),
+            "the disabled model must still be submitted: {page}"
+        );
+        // Disabled controls are not submitted, so hidden fields carry the assignment.
         assert_eq!(
-            post_form(&bare, "/cards/1", "column_id=1&title=Renamed&agent=claude").await,
+            post_form(
+                &bare,
+                "/cards/1",
+                "column_id=1&title=Renamed&agent=claude&model=haiku",
+            )
+            .await,
             StatusCode::NO_CONTENT
         );
         let (_, _, board) = send(&open, get("/board")).await;
         assert!(board.contains("Renamed") && board.contains("data-agent=\"claude\""));
+        let card = db.call(|conn| store::get_card(conn, 1)).await.unwrap();
+        assert_eq!(card.model_text(), "haiku");
     }
 
     fn wired_app() -> (Router, Db) {

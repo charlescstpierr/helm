@@ -89,15 +89,18 @@ async fn serve(config: &Config, db: Db) -> Result<(), Box<dyn Error>> {
     );
     let changes = state.changes();
 
+    // Bind before recovery: a second instance on the same address must not interrupt
+    // the runs still supervised by the instance that already owns the listener.
+    let listener = tokio::net::TcpListener::bind(config.bind)
+        .await
+        .map_err(|e| format!("cannot listen on {}: {e}", config.bind))?;
+
     // A previous Helm may have died mid-run, whatever the gate says today.
     let interrupted = supervisor::recover(&db, &changes).await?;
     if interrupted > 0 {
         eprintln!("helm: {interrupted} run(s) left running by a previous Helm marked interrupted");
     }
 
-    let listener = tokio::net::TcpListener::bind(config.bind)
-        .await
-        .map_err(|e| format!("cannot listen on {}: {e}", config.bind))?;
     eprintln!(
         "helm: listening on http://{} (database: {})",
         listener.local_addr()?,
@@ -168,5 +171,59 @@ async fn shutdown_signal() {
     tokio::select! {
         () = interrupt => {}
         () = terminate => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::{Agent, PermissionMode};
+    use crate::runs::{NewRun, RunStatus};
+    use crate::store::{CardInput, StoreError};
+
+    #[tokio::test]
+    async fn a_failed_bind_leaves_running_agents_and_their_threads_untouched() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::resolve(None, |_| None).unwrap();
+        config.bind = listener.local_addr().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let (card_id, run_id) = db
+            .call(|conn| {
+                let card_id = store::create_card(
+                    conn,
+                    2,
+                    &CardInput {
+                        title: "An agent is already working".to_owned(),
+                        ..CardInput::default()
+                    },
+                )?;
+                let run_id = runs::enqueue(
+                    conn,
+                    &NewRun {
+                        card_id,
+                        agent: Agent::Claude,
+                        model: None,
+                        permission_mode: PermissionMode::DEFAULT,
+                        prompt: "Keep working",
+                    },
+                )?
+                .unwrap();
+                runs::claim_next_queued(conn)?;
+                Ok::<_, StoreError>((card_id, run_id))
+            })
+            .await
+            .unwrap();
+
+        let error = serve(&config, db.clone()).await.unwrap_err();
+        assert!(error.to_string().contains("cannot listen"), "{error}");
+        db.call(move |conn| {
+            let run = runs::get_run(conn, run_id)?;
+            assert_eq!(run.status, RunStatus::Running);
+            assert!(run.finished_at.is_none());
+            assert!(store::list_comments(conn, card_id)?.is_empty());
+            Ok::<_, StoreError>(())
+        })
+        .await
+        .unwrap();
     }
 }

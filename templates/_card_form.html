@@ -43,6 +43,7 @@
     </div>
     <div class="field">
       <label for="card-model">Modèle</label>
+      {% if !agents.can_assign() && !card.model_text().is_empty() %}<input type="hidden" name="model" value="{{ card.model_text() }}">{% endif %}
       <input class="input" id="card-model" name="model" type="text" list="card-models" autocomplete="off" maxlength="100" aria-describedby="card-agent-hint" placeholder="{{ agents.model_placeholder() }}" value="{{ card.model_text() }}"{% if !agents.can_assign() %} disabled{% endif %}>
       <datalist id="card-models">
         <option value="haiku"></option>
