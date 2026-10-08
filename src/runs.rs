@@ -567,6 +567,19 @@ pub fn running_runs(conn: &Connection) -> Result<Vec<Orphan>> {
         .collect::<rusqlite::Result<_>>()?)
 }
 
+/// The pids of the card's earlier runs that a killed Helm left `interrupted`: the only runs
+/// whose agent may still be alive, since every other end signals the agent's group.
+pub fn interrupted_pids(conn: &Connection, card_id: i64, before: RunId) -> Result<Vec<i64>> {
+    Ok(conn
+        .prepare(
+            "SELECT pid FROM agent_runs
+             WHERE card_id = ?1 AND id < ?2 AND status = 'interrupted' AND pid IS NOT NULL
+             ORDER BY id DESC",
+        )?
+        .query_map((card_id, before), |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
 /// Appends to a run's log and returns the event's `seq`.
 pub fn append_event(conn: &Connection, run: RunId, event: &NewEvent) -> Result<i64> {
     Ok(conn.query_row(

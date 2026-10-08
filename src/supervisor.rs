@@ -225,6 +225,14 @@ fn log_store_error(context: &str, error: &StoreError) {
     eprintln!("helm: {context}: {error}");
 }
 
+/// A killed Helm leaves its agent running. Helm cannot tell that pid from a recycled one, so
+/// it never signals it: the human, who can, is told how.
+fn still_running_message(pid: i64) -> String {
+    format!(
+        "l'agent d'une exécution précédente tourne encore (groupe de processus {pid}) : Helm ne lance pas un second agent dans le même worktree. Arrêtez-le avec `kill -- -{pid}`, puis remettez la carte dans « À faire »."
+    )
+}
+
 const STOPPED_BY_SHUTDOWN: &str = "Helm s'est arrêté pendant l'exécution.";
 
 /// Marks every run left `running` by a previous Helm as `interrupted`. Nothing is relaunched:
@@ -234,7 +242,7 @@ pub async fn recover(db: &Db, changes: &Changes) -> Result<usize, StoreError> {
         .call(|conn| {
             let orphans = runs::running_runs(conn)?;
             for orphan in &orphans {
-                let still_alive = orphan.pid.is_some_and(process_exists);
+                let still_alive = orphan.pid.is_some_and(group_exists);
                 let reason = if still_alive {
                     "Helm s'est arrêté pendant l'exécution. Le processus de l'agent existe encore mais n'est plus supervisé."
                 } else {
@@ -256,12 +264,16 @@ pub async fn recover(db: &Db, changes: &Changes) -> Result<usize, StoreError> {
     Ok(count)
 }
 
-fn process_exists(pid: i64) -> bool {
-    let Ok(pid) = i32::try_from(pid) else {
+/// Whether the process group a run led is still populated. The agent is its leader, so this
+/// stays true while any process it started lives, even after the agent itself exited.
+fn group_exists(pid: i64) -> bool {
+    // 0 and 1 would not name a group: `kill(-0)` and `kill(-1)` reach this process's group and
+    // every process.
+    let Some(pid) = i32::try_from(pid).ok().filter(|pid| *pid > 1) else {
         return false;
     };
-    // SAFETY: signal 0 only checks that the process exists and can be signalled.
-    let rc = unsafe { libc::kill(pid, 0) };
+    // SAFETY: signal 0 only checks that the group exists and can be signalled.
+    let rc = unsafe { libc::kill(-pid, 0) };
     rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
@@ -434,6 +446,19 @@ impl Supervisor {
             Err(e) => return Outcome::Failed(format!("la carte est introuvable : {e}")),
         };
         self.changes.publish();
+
+        let earlier = self
+            .db
+            .call(move |conn| runs::interrupted_pids(conn, card_id, id))
+            .await;
+        match earlier {
+            Err(e) => return Outcome::Failed(format!("exécutions précédentes illisibles : {e}")),
+            Ok(pids) => {
+                if let Some(pid) = pids.into_iter().find(|pid| group_exists(*pid)) {
+                    return self.fail(id, still_running_message(pid)).await;
+                }
+            }
+        }
 
         let prepared = unless_cancelled(
             cancel,
@@ -882,6 +907,29 @@ mod tests {
                 },
             );
             let changes = Changes::new();
+            let task = tokio::spawn(Self::supervisor(
+                &remote,
+                &db,
+                &orchestrator,
+                &changes,
+                max_concurrent,
+            ));
+            Self {
+                remote,
+                db,
+                orchestrator,
+                changes,
+                task,
+            }
+        }
+
+        fn supervisor(
+            remote: &Remote,
+            db: &Db,
+            orchestrator: &Orchestrator,
+            changes: &Changes,
+            max_concurrent: usize,
+        ) -> impl Future<Output = ()> + use<> {
             let supervisor = Supervisor::new(
                 db.clone(),
                 orchestrator.clone(),
@@ -895,14 +943,32 @@ mod tests {
                     max_concurrent,
                 },
             );
-            let task = tokio::spawn(Arc::new(supervisor).run());
-            Self {
-                remote,
-                db,
-                orchestrator,
-                changes,
-                task,
-            }
+            Arc::new(supervisor).run()
+        }
+
+        /// The card goes back to "À faire" the way a human drags it there.
+        async fn requeue(&self, card: i64) {
+            let orchestrator = self.orchestrator.clone();
+            self.db
+                .call(move |conn| {
+                    store::move_card(conn, card, 1, 0)?;
+                    let entered = store::move_card(conn, card, 2, 0)?;
+                    orchestrator.after_placement(conn, card, entered)
+                })
+                .await
+                .unwrap();
+        }
+
+        /// A new supervisor, as after a restart of Helm.
+        fn restart(&mut self) {
+            self.task.abort();
+            self.task = tokio::spawn(Self::supervisor(
+                &self.remote,
+                &self.db,
+                &self.orchestrator,
+                &self.changes,
+                2,
+            ));
         }
 
         /// A card with the agent assigned, created straight in `À faire` so a run is queued.
@@ -1271,6 +1337,15 @@ mod tests {
         ));
     }
 
+    fn process_exists(pid: i64) -> bool {
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: signal 0 only checks that the process exists and can be signalled.
+        let rc = unsafe { libc::kill(pid, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
     enum Stop {
         Cancel,
         Shutdown,
@@ -1465,7 +1540,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_run_left_running_by_a_dead_helm_becomes_interrupted_and_is_never_relaunched() {
-        let h = Harness::new("sup-recover");
+        let mut h = Harness::new("sup-recover");
         h.task.abort();
         let card = h.card("success", "").await;
         // Simulate the previous Helm: the run was claimed, its process is gone.
@@ -1489,24 +1564,63 @@ mod tests {
         assert_eq!(recover(&h.db, &h.changes).await.unwrap(), 0, "idempotent");
 
         // A fresh supervisor does not pick the interrupted run up again.
-        let supervisor = Supervisor::new(
-            h.db.clone(),
-            h.orchestrator.clone(),
-            Arc::new(ClaudeAdapter {
-                command: PathBuf::from(FAKE_CLAUDE),
-            }),
-            h.changes.clone(),
-            SupervisorConfig {
-                repo: h.remote.repo.clone(),
-                worktree_root: h.remote.worktrees.clone(),
-                max_concurrent: 1,
-            },
-        );
-        let task = tokio::spawn(Arc::new(supervisor).run());
+        h.restart();
         tokio::time::sleep(Duration::from_millis(300)).await;
-        task.abort();
         assert_eq!(h.latest(card).await.status, RunStatus::Interrupted);
         assert!(!h.remote.worktrees.join("HELM-1").exists());
+    }
+
+    #[tokio::test]
+    async fn a_new_run_is_refused_while_the_previous_agent_still_lives_in_the_worktree() {
+        let mut h = Harness::new("sup-orphan");
+        h.task.abort();
+        let card = h.card("success", "").await;
+        // The agent of a Helm that was killed with SIGKILL: alive, in its own group.
+        use std::os::unix::process::CommandExt;
+        let mut orphan = std::process::Command::new("sleep")
+            .arg("301")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let orphan_id = orphan.id();
+        let orphan_pid = i64::from(orphan_id);
+        h.db.call(move |conn| {
+            let run = runs::claim_next_queued(conn)?.unwrap();
+            runs::record_pid(conn, run.id, orphan_id)?;
+            Ok::<_, StoreError>(())
+        })
+        .await
+        .unwrap();
+        recover(&h.db, &h.changes).await.unwrap();
+        h.restart();
+
+        let interrupted = h.latest(card).await;
+        assert_eq!(interrupted.status, RunStatus::Interrupted);
+        h.requeue(card).await;
+        let refused = h
+            .wait_for(card, |r| r.id > interrupted.id && !r.status.is_active())
+            .await;
+        assert_eq!(refused.status, RunStatus::Failed, "{:?}", refused.error);
+
+        let error = refused.error.as_deref().unwrap();
+        assert!(
+            error.contains(&format!("kill -- -{orphan_pid}")),
+            "the card says how to stop the old agent: {error}"
+        );
+        assert!(refused.pid.is_none(), "no second agent was launched");
+        assert!(!h.remote.worktrees.join("HELM-1").exists());
+        assert!(
+            group_exists(orphan_pid),
+            "Helm does not kill a process it cannot identify"
+        );
+
+        orphan.kill().unwrap();
+        orphan.wait().unwrap();
+        h.requeue(card).await;
+        let run = h
+            .wait_for(card, |r| r.id > refused.id && !r.status.is_active())
+            .await;
+        assert_eq!(run.status, RunStatus::Succeeded, "{:?}", run.error);
     }
 
     #[test]
@@ -1543,8 +1657,9 @@ mod tests {
 
     #[test]
     fn a_dead_pid_is_not_a_live_process() {
-        assert!(process_exists(i64::from(std::process::id())));
-        assert!(!process_exists(2_000_000_000));
-        assert!(!process_exists(i64::MAX));
+        assert!(!group_exists(2_000_000_000));
+        assert!(!group_exists(i64::MAX));
+        assert!(!group_exists(0));
+        assert!(!group_exists(-1));
     }
 }
