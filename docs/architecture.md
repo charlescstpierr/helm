@@ -282,10 +282,15 @@ codex exec --json "<consigne>"                          # prévu ; reprise : cod
   nouvelle exécution est refusée tant que le groupe de processus d'une exécution interrompue de
   la carte existe encore, avec la commande qui l'arrête. Une seule exécution active par
   carte (index unique partiel).
-- **Fin de travail : pousser la branche.** Après un succès de l'agent, Helm vérifie que l'exécution
-  a ajouté au moins un commit depuis son lancement (sinon elle échoue : « rien à pousser »), puis exécute `git push --set-upstream origin helm/<clé>-<n>`,
-  jamais forcé. Aucune PR n'est ouverte. Un push refusé ou impossible fait échouer l'exécution :
-  la base refuse un `succeeded` sans `pushed_at`. Les modifications non commitées laissées par
+- **Fin de travail : pousser la branche.** Après un succès de l'agent, Helm demande à
+  `origin` où en est la branche (`git ls-remote`, jamais la copie locale `origin/<branche>`, qui peut
+  être périmée) et la compare au worktree. Si la branche porte des commits que `origin` n'a pas,
+  qu'ils viennent de cette exécution ou d'une précédente restée sans push, Helm exécute
+  `git push --set-upstream origin helm/<clé>-<n>`, jamais forcé. Si `origin` a déjà tout (ou n'a pas
+  la branche et que le worktree n'ajoute rien à la branche par défaut), l'exécution échoue : « rien à
+  pousser ». Si `origin` a des commits que le worktree n'a pas (historique réécrit, travail poussé
+  d'ailleurs), elle échoue aussi, sans push. `origin` injoignable : elle échoue. Aucune PR n'est ouverte. Un
+  push refusé ou impossible fait échouer l'exécution : la base refuse un `succeeded` sans `pushed_at`. Les modifications non commitées laissées par
   l'agent restent dans le worktree et sont signalées dans le journal.
 
 Un trait `AgentAdapter` isole ce qui diffère entre CLI : construire la commande (lancement et

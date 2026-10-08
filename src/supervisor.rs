@@ -538,10 +538,6 @@ impl Supervisor {
         )
         .await;
 
-        let started_at = match git::head(&worktree.path).await {
-            Ok(head) => head,
-            Err(e) => return Outcome::Failed(format!("HEAD du worktree illisible : {e}")),
-        };
         let mut child = match self.spawn_agent(run, &worktree.path) {
             Ok(child) => child,
             Err(e) => return Outcome::Failed(e),
@@ -586,8 +582,7 @@ impl Supervisor {
             return Outcome::Failed(why);
         }
 
-        self.publish_branch(id, &worktree, &started_at, cancel)
-            .await
+        self.publish_branch(id, &worktree, cancel).await
     }
 
     fn spawn_agent(&self, run: &Run, cwd: &std::path::Path) -> Result<Child, String> {
@@ -765,35 +760,43 @@ impl Supervisor {
         &self,
         id: RunId,
         worktree: &git::Worktree,
-        started_at: &str,
         cancel: &Notify,
     ) -> Outcome {
-        let added = git::commits_since(&worktree.path, started_at).await;
-        match added {
-            Err(e) => {
+        let branch = &worktree.branch;
+        let pending = unless_cancelled(cancel, git::unpublished(&self.config.repo, worktree)).await;
+        match pending {
+            None => return self.stopped(),
+            Some(Err(e)) => {
                 return self
                     .fail(
                         id,
-                        format!("les commits de la branche sont illisibles : {e}"),
+                        format!("la branche {branch} ne peut pas être comparée à origin : {e}"),
                     )
                     .await;
             }
-            Ok(0) => {
+            Some(Ok(git::Unpublished::Nothing)) => {
+                return self
+                    .fail(
+                        id,
+                        format!("rien à pousser : origin a déjà tous les commits de {branch}."),
+                    )
+                    .await;
+            }
+            Some(Ok(git::Unpublished::Diverged)) => {
                 return self
                     .fail(
                         id,
                         format!(
-                            "l'agent a terminé sans rien commiter sur {} : rien à pousser.",
-                            worktree.branch
+                            "origin a sur {branch} des commits que le worktree n'a pas (historique réécrit ou travail poussé d'ailleurs) : Helm ne force jamais le push. Réconciliez la branche à la main, puis relancez."
                         ),
                     )
                     .await;
             }
-            Ok(count) => {
+            Some(Ok(git::Unpublished::Commits(count))) => {
                 self.note(
                     id,
                     EventKind::Notice,
-                    format!("{count} commit(s) à pousser sur {}.", worktree.branch),
+                    format!("{count} commit(s) à pousser sur {branch}."),
                 )
                 .await;
             }
@@ -1414,14 +1417,17 @@ mod tests {
 
         assert_eq!(run.status, RunStatus::Failed);
         assert!(
-            run.error.as_deref().unwrap().contains("git push a échoué"),
+            run.error
+                .as_deref()
+                .unwrap()
+                .contains("ne peut pas être comparée à origin"),
             "{:?}",
             run.error
         );
         assert!(run.pushed_at.is_none());
         assert_eq!(run.exit_code, Some(0), "the agent itself succeeded");
         assert_eq!(h.column_category(card).await, Category::InProgress);
-        assert!(h.comments(card).await[0].contains("git push a échoué"));
+        assert!(h.comments(card).await[0].contains("origin"));
         // The commit is still in the worktree for a human to deal with.
         assert!(h.remote.worktrees.join("HELM-1/HELLO.md").exists());
     }
@@ -1433,7 +1439,7 @@ mod tests {
         let run = h.settled(card).await;
         assert_eq!(run.status, RunStatus::Failed);
         assert!(
-            run.error.as_deref().unwrap().contains("rien commiter"),
+            run.error.as_deref().unwrap().contains("rien à pousser"),
             "{:?}",
             run.error
         );
@@ -1464,7 +1470,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_rerun_that_adds_no_commit_fails_even_though_the_branch_is_already_ahead() {
+    async fn a_rerun_that_adds_nothing_fails_when_origin_already_has_the_branch_tip() {
         let h = Harness::new("sup-rerun");
         let card = h.card("success", "").await;
         let first = h.settled(card).await;
@@ -1483,11 +1489,70 @@ mod tests {
 
         assert_eq!(second.status, RunStatus::Failed, "{:?}", second.error);
         assert!(
-            second.error.as_deref().unwrap().contains("rien commiter"),
+            second.error.as_deref().unwrap().contains("rien à pousser"),
             "{:?}",
             second.error
         );
         assert!(second.pushed_at.is_none());
+        assert_eq!(h.column_category(card).await, Category::InProgress);
+    }
+
+    #[tokio::test]
+    async fn a_rerun_publishes_commits_an_earlier_run_made_but_could_not_push() {
+        let h = Harness::new("sup-retry-push");
+        let origin = h.remote.origin.to_str().unwrap().to_owned();
+        git_run(
+            &h.remote.repo,
+            &["remote", "set-url", "origin", "/nonexistent/origin.git"],
+        );
+        let card = h.card("success", "").await;
+        let first = h.settled(card).await;
+        assert_eq!(first.status, RunStatus::Failed, "{:?}", first.error);
+        assert!(h.remote.worktrees.join("HELM-1/HELLO.md").exists());
+
+        git_run(&h.remote.repo, &["remote", "set-url", "origin", &origin]);
+        h.requeue(card).await;
+        let second = h
+            .wait_for(card, |run| run.id != first.id && !run.status.is_active())
+            .await;
+
+        assert_eq!(second.status, RunStatus::Succeeded, "{:?}", second.error);
+        assert!(second.pushed_at.is_some());
+        let landed = git_run(
+            &h.remote.origin,
+            &["log", "-1", "--format=%s", "helm/HELM-1"],
+        );
+        assert_eq!(landed, "Add HELLO.md");
+        assert_eq!(h.column_category(card).await, Category::InReview);
+    }
+
+    #[tokio::test]
+    async fn a_rerun_after_pushed_history_was_rewritten_fails_and_never_forces() {
+        let h = Harness::new("sup-diverged");
+        let card = h.card("success", "").await;
+        let first = h.settled(card).await;
+        assert_eq!(first.status, RunStatus::Succeeded, "{:?}", first.error);
+        let pushed = git_run(&h.remote.origin, &["rev-parse", "helm/HELM-1"]);
+
+        let worktree = h.remote.worktrees.join("HELM-1");
+        git_run(&worktree, &["commit", "-q", "--amend", "-m", "Rewritten"]);
+        h.requeue(card).await;
+        let second = h
+            .wait_for(card, |run| run.id != first.id && !run.status.is_active())
+            .await;
+
+        assert_eq!(second.status, RunStatus::Failed, "{:?}", second.error);
+        assert!(
+            second.error.as_deref().unwrap().contains("ne force jamais"),
+            "{:?}",
+            second.error
+        );
+        assert!(second.pushed_at.is_none());
+        assert_eq!(
+            git_run(&h.remote.origin, &["rev-parse", "helm/HELM-1"]),
+            pushed,
+            "origin's branch is untouched"
+        );
         assert_eq!(h.column_category(card).await, Category::InProgress);
     }
 
