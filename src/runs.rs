@@ -264,6 +264,8 @@ pub struct Activity {
     pub events: Vec<RunEvent>,
     /// Events of the run in total, shown or not.
     pub total_events: i64,
+    /// How many of them are CLI bookkeeping, which the panel never shows.
+    pub bookkeeping_events: i64,
     /// Database time when this was read, so a running run's duration is current.
     pub now: i64,
 }
@@ -277,6 +279,25 @@ impl Activity {
 
     pub fn hidden_events(&self) -> i64 {
         self.total_events - self.events.len() as i64
+    }
+
+    /// Why `hidden_events` are hidden: CLI bookkeeping, and events before the latest
+    /// [`ACTIVITY_EVENT_LIMIT`].
+    pub fn hidden_reason(&self) -> String {
+        let older = self.hidden_events() - self.bookkeeping_events;
+        let mut reasons = Vec::new();
+        if self.bookkeeping_events > 0 {
+            reasons.push(format!(
+                "{} de bruit interne du CLI",
+                self.bookkeeping_events
+            ));
+        }
+        if older > 0 {
+            reasons.push(format!(
+                "{older} plus anciens que les {ACTIVITY_EVENT_LIMIT} derniers"
+            ));
+        }
+        reasons.join(" et ")
     }
 }
 
@@ -619,19 +640,22 @@ pub fn activity(conn: &Connection, card_id: i64) -> Result<Activity> {
             run: None,
             events: Vec::new(),
             total_events: 0,
+            bookkeeping_events: 0,
             now,
         });
     };
     let events = list_events(conn, run.id, ACTIVITY_EVENT_LIMIT)?;
-    let total_events = conn.query_row(
-        "SELECT COUNT(*) FROM agent_events WHERE run_id = ?1",
+    let (total_events, bookkeeping_events) = conn.query_row(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE kind = 'system') FROM agent_events
+         WHERE run_id = ?1",
         [run.id],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     Ok(Activity {
         run: Some(run),
         events,
         total_events,
+        bookkeeping_events,
         now,
     })
 }
@@ -917,6 +941,38 @@ mod tests {
             [(1, EventKind::Init, "b"), (2, EventKind::ToolUse, "c")]
         );
         assert_eq!(list_events(&conn, first, 100).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_activity_says_how_many_events_are_hidden_and_why() {
+        let (mut conn, card) = conn_with_card();
+        let id = queue(&mut conn, card, "p").unwrap();
+        let add = |conn: &Connection, kind| {
+            let event = NewEvent {
+                kind,
+                summary: "e".to_owned(),
+                payload: "{}".to_owned(),
+            };
+            append_event(conn, id, &event).unwrap();
+        };
+        add(&conn, EventKind::System);
+        for _ in 0..3 {
+            add(&conn, EventKind::Message);
+        }
+        let shown = activity(&conn, card).unwrap();
+        assert_eq!((shown.total_events, shown.hidden_events()), (4, 1));
+        assert_eq!(shown.hidden_reason(), "1 de bruit interne du CLI");
+
+        for _ in 0..ACTIVITY_EVENT_LIMIT + 2 {
+            add(&conn, EventKind::ToolUse);
+        }
+        add(&conn, EventKind::System);
+        let capped = activity(&conn, card).unwrap();
+        assert_eq!(capped.events.len() as i64, ACTIVITY_EVENT_LIMIT);
+        assert_eq!(
+            capped.hidden_reason(),
+            "2 de bruit interne du CLI et 5 plus anciens que les 200 derniers"
+        );
     }
 
     #[test]

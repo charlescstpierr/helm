@@ -34,7 +34,7 @@
   </ol>
   {% endif %}
   {% if activity.hidden_events() > 0 %}
-  <p class="field__hint">{{ activity.total_events }} événements enregistrés, {{ activity.hidden_events() }} non affichés (bruit interne du CLI, ou plus anciens que les {{ activity.events.len() }} derniers).</p>
+  <p class="field__hint">{{ activity.total_events }} événements enregistrés, {{ activity.hidden_events() }} non affichés ({{ activity.hidden_reason() }}).</p>
   {% endif %}
   {% if !run.stderr.is_empty() %}
   <details class="activity__details">
