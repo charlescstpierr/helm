@@ -147,28 +147,45 @@ projects 1──* board_columns 1──* cards *──* labels
   l'agent X, le plus ancien d'abord » une seule requête sur l'index. Rien ne consomme encore
   les mentions : le fil les met seulement en évidence.
 
-### Prévu (migrations suivantes)
+### Livré avec l'orchestrateur (migration `0004_agent_runs`)
 
-- **`cards.parent_id`** — sous-cartes : un agent découpe son travail ou délègue en créant des
-  cartes filles.
+- **`cards.agent`**, **`cards.model`** — l'assignation est **par carte** : un agent (`claude`, ou
+  rien) et un modèle (`--model`, ou rien pour le défaut du projet dans `helm.toml`). Ni l'un ni
+  l'autre n'est contraint en base (comme `mentions.target`) : les valeurs connues vivent dans
+  `src/agent.rs`. Sans dépôt configuré, aucun agent ne peut être assigné.
 - **`agent_runs`** (exécutions d'agent) — une ligne par lancement d'un agent sur une carte :
 
   | Colonne           | Sens                                                               |
   | ----------------- | ------------------------------------------------------------------ |
-  | `card_id`         | Carte servie.                                                      |
-  | `agent`           | `claude` ou `codex` (extensible).                                  |
+  | `card_id`         | Carte servie (suppression en cascade).                             |
+  | `agent`, `model`, `permission_mode` | Ce avec quoi l'exécution a été lancée.           |
   | `status`          | `queued`, `running`, `succeeded`, `failed`, `cancelled`, `interrupted`. |
-  | `session_id`      | Identifiant de session rendu par le CLI, clé de la reprise.        |
-  | `resumed_from`    | Exécution précédente, quand celle-ci en reprend une.               |
-  | `worktree_path`, `branch` | Worktree git isolé de la carte.                            |
   | `prompt`          | Consigne envoyée (pour l'audit et la relance).                     |
+  | `session_id`      | Identifiant de session rendu par le CLI, clé de la reprise.        |
+  | `resumed_from`    | Exécution précédente, quand celle-ci en reprend une (réservé).     |
+  | `worktree_path`, `branch` | Worktree git isolé de la carte.                            |
   | `pid`, `exit_code`| Suivi du processus.                                                |
+  | `error`, `stderr` | Pourquoi l'exécution a échoué ; sortie d'erreur du CLI, à part.    |
   | `cost_usd`, `tokens_in`, `tokens_out` | Consommation, quand le CLI la rapporte.        |
-  | `started_at`, `finished_at` | Horodatages.                                             |
+  | `queued_at`, `started_at`, `finished_at`, `pushed_at` | Horodatages.                   |
 
-- **`agent_events`** — journal append-only d'une exécution : `run_id`, `seq`, `kind`
-  (`message`, `tool_use`, `tool_result`, `error`, `result`…), `payload` (JSON brut du CLI),
-  `created_at`. C'est le fil d'activité affiché sur la carte.
+  Le statut est une machine à états (`RunStatus::can_become` dans `src/runs.rs`) :
+  `queued → running | cancelled`, `running → succeeded | failed | cancelled | interrupted`, et
+  rien ne sort d'un état final (un nouvel essai est une nouvelle exécution). La base garantit
+  deux invariants : au plus une exécution active (`queued` ou `running`) par carte, par un
+  index unique partiel ; et une exécution n'est `succeeded` que si sa branche est poussée
+  (`pushed_at`), si bien qu'un échec de `git push` ne peut pas être enregistré comme un succès.
+  Une carte qui porte une exécution active ne se supprime pas.
+
+- **`agent_events`** — journal append-only d'une exécution : `run_id`, `seq` (dense par
+  exécution), `kind` (`init`, `message`, `tool_use`, `tool_result`, `result`, `system`,
+  `notice`, `error`, `malformed`), `summary` (la ligne affichée sur la carte), `payload` (ligne
+  JSON brute du CLI, intacte), `created_at`. C'est le fil d'activité affiché sur la carte.
+
+### Prévu (migrations suivantes)
+
+- **`cards.parent_id`** — sous-cartes : un agent découpe son travail ou délègue en créant des
+  cartes filles.
 
 ## 4. Cycle de vie d'une carte
 

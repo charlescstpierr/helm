@@ -6,3 +6,19 @@ bind = "127.0.0.1:7878"
 
 # SQLite database file (created on first start, WAL mode).
 db_path = "helm.db"
+
+# --- Agents ---------------------------------------------------------------------------
+# Without `project.repo` the board works as a plain kanban and agents cannot be assigned.
+# Runs also need a loopback `bind`: Helm has no authentication, and a run executes code.
+#
+# [project]
+# repo = "~/code/my-project"                          # git repository cards are worked on in
+# worktree_root = "~/.local/share/helm/worktrees"     # one worktree per card: <root>/<KEY>-<n>
+#
+# [agents]
+# max_concurrent = 2                                  # runs in flight at once
+#
+# [agents.claude]
+# command = "claude"                                  # executable, looked up on PATH
+# permission_mode = "bypassPermissions"               # acceptEdits | auto | bypassPermissions | manual | dontAsk | plan
+# model = "sonnet"                                    # default for cards that name no model

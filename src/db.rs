@@ -26,6 +26,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "autoincrement_comment_ids",
         sql: include_str!("../migrations/0003_autoincrement_comment_ids.sql"),
     },
+    Migration {
+        version: 4,
+        name: "agent_runs",
+        sql: include_str!("../migrations/0004_agent_runs.sql"),
+    },
 ];
 
 struct Migration {

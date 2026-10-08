@@ -32,6 +32,12 @@ Tout est optionnel. Ordre de priorité : variables d'environnement, puis fichier
 | --------------------- | --------------------- | ---------------- | ---------------------------------------------- |
 | `bind`                | `HELM_BIND`           | `127.0.0.1:7878` | Adresse d'écoute.                              |
 | `db_path`             | `HELM_DB`             | `helm.db`        | Fichier SQLite (mode WAL).                     |
+| `project.repo`        |                       | aucun            | Dépôt git des cartes. Sans lui, pas d'agents.  |
+| `project.worktree_root` |                     | `~/.local/share/helm/worktrees` | Un worktree par carte : `<racine>/<CLÉ>-<n>`. |
+| `agents.max_concurrent` |                     | `2`              | Exécutions simultanées au plus.                |
+| `agents.claude.command` |                     | `claude`         | Exécutable de Claude Code.                     |
+| `agents.claude.permission_mode` |             | `bypassPermissions` | `--permission-mode` des exécutions.         |
+| `agents.claude.model` |                       | celui du CLI     | Modèle des cartes qui n'en nomment pas.        |
 
 Le fichier lu est `helm.toml` dans le répertoire courant s'il existe, ou celui désigné par
 `HELM_CONFIG`. Un `helm.toml` absent laisse les défauts ; un fichier présent mais illisible ou
