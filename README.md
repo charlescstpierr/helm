@@ -23,7 +23,8 @@ pour l'ouvrir, `N` pour en créer une.
 
 Chaque carte a un fil de commentaires, sous son formulaire d'édition (`Ctrl` + `Entrée` envoie).
 `@claude`, `@codex` et `@moi` y sont reconnus et enregistrés comme mentions non traitées ; rien
-ne les consomme encore. Le nombre de commentaires s'affiche sur la carte quand il n'est pas nul.
+ne les consomme encore. Un commentaire ordinaire ne lance pas d'agent. Le nombre de commentaires
+s'affiche sur la carte quand il n'est pas nul.
 
 ## Configurer
 
@@ -82,6 +83,34 @@ exécution sur la même carte est refusée tant que ce groupe de processus exist
 exécution ayant lancé un agent compte). Le message dit de vérifier ce qu'est ce processus avant de
 l'arrêter (`kill -- -<pid>`), car Helm ne peut pas le distinguer d'un processus qui aurait reçu le
 même numéro.
+
+## Reprendre avec des commentaires
+
+Après une revue, un échec ou une interruption, ouvrez la carte et décrivez la correction attendue
+dans « Demander une correction », puis cliquez sur « Reprendre avec ces retours ». Helm ajoute
+votre commentaire au fil et met une **nouvelle exécution** en file. Claude reprend sa session
+dans le même worktree et sur la même
+branche, avec le modèle et le mode de permission de l'exécution précédente. Les modifications
+non commitées restent disponibles ; les exécutions précédentes et leurs résultats sont conservés.
+Cette action fonctionne avec ou sans JavaScript et ne demande aucune configuration supplémentaire.
+
+La reprise porte sur la dernière exécution, qui doit être terminée. La carte doit toujours
+être assignée au même agent et ne pas être dans « Terminé ». Helm doit connaître une session
+et son worktree ; si une reprise a été annulée en file, il retrouve ces informations dans la
+chaîne des exécutions précédentes. Une exécution active ou une opération GitHub en cours empêche
+une seconde reprise. Un formulaire devenu périmé est refusé sans ajouter de commentaire.
+
+Helm refuse de remplacer un worktree disparu ou incompatible. Si Claude ne retrouve plus
+l'historique de sa session sur la machine, l'exécution échoue avec le diagnostic du CLI : Helm
+ne repart pas automatiquement dans une session vierge. Remettre la carte dans « À faire » reste
+le moyen de lancer une nouvelle session. Un commentaire ordinaire, même avec `@claude`, ne
+déclenche aucune exécution.
+
+Après la correction, Helm refait les vérifications et pousse le nouveau commit. Si une PR est
+déjà liée à la carte, il garde son numéro et sa base ; une PR fermée, fusionnée ou dont la base
+a changé ne peut pas être remplacée silencieusement par une autre. Une reprise rend les anciens
+résultats insuffisants pour fusionner : la PR doit correspondre à la dernière exécution réussie
+et à son commit vérifié.
 
 ## Vérifier le travail avant le push
 

@@ -61,6 +61,7 @@ impl Fixture {
                 let run_id = queue(conn, card_id)?;
                 runs::claim_next_queued(conn)?;
                 runs::record_workspace(conn, run_id, &path, &branch)?;
+                runs::record_session(conn, run_id, "session-delivery")?;
                 let commands = if status == VerificationStatus::Skipped {
                     Vec::new()
                 } else {
@@ -220,6 +221,29 @@ impl Fixture {
             .unwrap()
     }
 
+    async fn add_resumed_run(
+        &self,
+        parent: RunId,
+        status: RunStatus,
+        verified: Option<&str>,
+    ) -> Run {
+        let id = self.add_run(status).await;
+        let verified = verified.map(str::to_owned);
+        self.db
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE agent_runs SET resumed_from = ?2 WHERE id = ?1",
+                    (id, parent),
+                )?;
+                if let Some(head) = verified {
+                    checks::start(conn, id, &head, &[])?;
+                }
+                runs::get_run(conn, id)
+            })
+            .await
+            .unwrap()
+    }
+
     async fn add_run(&self, status: RunStatus) -> RunId {
         let card_id = self.card_id;
         let branch = self.branch.clone();
@@ -300,7 +324,7 @@ async fn snapshot_round_trips_and_a_new_snapshot_clears_the_last_error() {
 }
 
 #[tokio::test]
-async fn expected_base_survives_snapshot_changes_and_resets_for_a_new_delivery() {
+async fn expected_base_survives_new_runs_on_the_same_pr_and_resets_for_a_new_pr() {
     let f = Fixture::new().await;
     f.attach().await;
     assert_eq!(f.saved().await.expected_base, "main");
@@ -323,7 +347,7 @@ async fn expected_base_survives_snapshot_changes_and_resets_for_a_new_delivery()
         .await
         .unwrap();
     assert_eq!(f.saved().await.run_id, new_run);
-    assert_eq!(f.saved().await.expected_base, "develop");
+    assert_eq!(f.saved().await.expected_base, "main");
 
     retargeted.number = 8;
     retargeted.url = "https://github.com/owner/repo/pull/8".to_owned();
@@ -721,4 +745,172 @@ async fn disabled_delivery_never_starts_an_external_process() {
     }
     f.assert_no_github_commands();
     assert_eq!(f.category().await, Category::InReview);
+}
+
+#[tokio::test]
+async fn a_resumed_run_publishes_the_same_pr_and_its_new_verified_commit() {
+    let f = Fixture::new().await;
+    f.attach().await;
+    let resumed = f
+        .add_resumed_run(f.run_id, RunStatus::Succeeded, Some(OTHER_HEAD))
+        .await;
+    let mut updated = f.raw_pr();
+    updated["headRefOid"] = json!(OTHER_HEAD);
+    updated["statusCheckRollup"] = json!([{"__typename": "StatusContext", "state": "PENDING"}]);
+    f.json("view.json", &updated);
+    let mut replacement = updated.clone();
+    replacement["number"] = json!(8);
+    replacement["url"] = json!("https://github.com/owner/repo/pull/8");
+    f.json("list.json", &json!([replacement]));
+
+    f.delivery.publish(resumed.id, OTHER_HEAD).await.unwrap();
+
+    let saved = f.saved().await;
+    assert_eq!(saved.run_id, resumed.id);
+    assert_eq!(saved.pr.number, 7);
+    assert_eq!(saved.pr.head_sha, OTHER_HEAD);
+    assert_eq!(saved.pr.checks, CiStatus::Pending);
+    assert_eq!(saved.expected_base, "main");
+    assert_eq!(f.read("commands.log"), "view\n");
+    assert_eq!(f.category().await, Category::InReview);
+}
+
+#[tokio::test]
+async fn resumed_publication_never_replaces_a_closed_merged_or_changed_pr() {
+    for (field, value) in [
+        ("state", json!("CLOSED")),
+        ("state", json!("MERGED")),
+        ("headRefName", json!("helm/other")),
+        ("baseRefName", json!("develop")),
+        (
+            "headRefOid",
+            json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        ),
+    ] {
+        let f = Fixture::new().await;
+        f.attach().await;
+        let resumed = f
+            .add_resumed_run(f.run_id, RunStatus::Succeeded, Some(OTHER_HEAD))
+            .await;
+        let mut changed = f.raw_pr();
+        changed["headRefOid"] = json!(OTHER_HEAD);
+        changed[field] = value;
+        f.json("view.json", &changed);
+        f.json("list.json", &json!([]));
+        f.json("after-create.json", &f.raw_pr());
+
+        assert!(
+            f.delivery.publish(resumed.id, OTHER_HEAD).await.is_err(),
+            "{field}"
+        );
+        assert_eq!(f.read("commands.log"), "view\n", "{field}");
+        assert_eq!(f.saved().await.run_id, f.run_id);
+        assert!(!f.delivery.locks().contains(f.card_id));
+    }
+}
+
+#[tokio::test]
+async fn resumed_publication_rejects_a_changed_configured_repository() {
+    let f = Fixture::new().await;
+    f.attach().await;
+    let resumed = f
+        .add_resumed_run(f.run_id, RunStatus::Succeeded, Some(OTHER_HEAD))
+        .await;
+    let mut delivery = f.delivery.clone();
+    delivery.config.as_mut().unwrap().repository = "other/repo".to_owned();
+    assert!(delivery.publish(resumed.id, OTHER_HEAD).await.is_err());
+    f.assert_no_github_commands();
+    assert_eq!(f.saved().await.run_id, f.run_id);
+}
+
+#[tokio::test]
+async fn resume_validates_the_live_pr_before_starting_the_agent() {
+    let f = Fixture::new().await;
+    f.attach().await;
+    let resumed = f.add_resumed_run(f.run_id, RunStatus::Running, None).await;
+    f.delivery.validate_resume(&resumed).await.unwrap();
+    assert_eq!(f.read("commands.log"), "view\n");
+    assert!(!f.delivery.locks().contains(f.card_id));
+    assert_eq!(f.saved().await.run_id, f.run_id);
+}
+
+#[tokio::test]
+async fn resume_rejects_closed_merged_retargeted_and_externally_changed_prs() {
+    for (field, value) in [
+        ("state", json!("CLOSED")),
+        ("state", json!("MERGED")),
+        ("headRefName", json!("helm/other")),
+        ("baseRefName", json!("develop")),
+        ("headRefOid", json!(OTHER_HEAD)),
+    ] {
+        let f = Fixture::new().await;
+        f.attach().await;
+        let resumed = f.add_resumed_run(f.run_id, RunStatus::Running, None).await;
+        let mut changed = f.raw_pr();
+        changed[field] = value;
+        f.json("view.json", &changed);
+        assert!(
+            f.delivery.validate_resume(&resumed).await.is_err(),
+            "{field}"
+        );
+        assert_eq!(f.read("commands.log"), "view\n", "{field}");
+        assert!(!f.delivery.locks().contains(f.card_id));
+    }
+}
+
+#[tokio::test]
+async fn a_refreshed_external_head_is_not_trusted_for_a_resume() {
+    let f = Fixture::new().await;
+    f.attach().await;
+    let mut changed = f.raw_pr();
+    changed["headRefOid"] = json!(OTHER_HEAD);
+    f.json("view.json", &changed);
+    f.delivery.refresh(f.card_id).await.unwrap();
+    assert_eq!(f.saved().await.pr.head_sha, OTHER_HEAD);
+    let resumed = f.add_resumed_run(f.run_id, RunStatus::Running, None).await;
+    assert!(f.delivery.validate_resume(&resumed).await.is_err());
+}
+
+#[tokio::test]
+async fn resume_accepts_the_last_pushed_ancestor_after_publication_was_unavailable() {
+    let f = Fixture::new().await;
+    f.attach().await;
+    let unpublished = f
+        .add_resumed_run(f.run_id, RunStatus::Succeeded, Some(OTHER_HEAD))
+        .await;
+    let failed = f
+        .add_resumed_run(unpublished.id, RunStatus::Failed, None)
+        .await;
+    let resumed = f.add_resumed_run(failed.id, RunStatus::Running, None).await;
+    let mut live = f.raw_pr();
+    live["headRefOid"] = json!(OTHER_HEAD);
+    f.json("view.json", &live);
+
+    f.delivery.validate_resume(&resumed).await.unwrap();
+
+    assert_eq!(f.read("commands.log"), "view\n");
+    assert_eq!(f.saved().await.run_id, f.run_id);
+}
+
+#[tokio::test]
+async fn resume_without_github_or_without_a_saved_pr_starts_no_github_command() {
+    let f = Fixture::new().await;
+    let resumed = f.add_resumed_run(f.run_id, RunStatus::Running, None).await;
+    f.delivery.validate_resume(&resumed).await.unwrap();
+    f.attach().await;
+    let mut disabled = f.delivery.clone();
+    disabled.config = None;
+    disabled.validate_resume(&resumed).await.unwrap();
+    f.assert_no_github_commands();
+}
+
+#[tokio::test]
+async fn resume_rejects_a_pr_from_a_changed_configured_repository() {
+    let f = Fixture::new().await;
+    f.attach().await;
+    let resumed = f.add_resumed_run(f.run_id, RunStatus::Running, None).await;
+    let mut changed = f.delivery.clone();
+    changed.config.as_mut().unwrap().repository = "other/repo".to_owned();
+    assert!(changed.validate_resume(&resumed).await.is_err());
+    f.assert_no_github_commands();
 }

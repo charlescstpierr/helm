@@ -305,6 +305,30 @@
 
   const activityElement = () => dialogBody.querySelector('#run-activity');
 
+  function syncResumeForm() {
+    const form = dialogBody.querySelector('form[data-resume-form]');
+    const state = activityElement()?.querySelector('[data-resume-state]');
+    if (!form || !state) return;
+    const hasDraft = form.elements.body.value.length > 0;
+    const source = form.elements.source_run_id;
+    const latest = state.dataset.sourceRunId;
+    const available = state.dataset.available === 'true';
+    // A draft belongs to the execution the reviewer saw when they started writing it.
+    // Never silently retarget it when another tab starts a new run.
+    if (!hasDraft) source.value = latest;
+    const stale = hasDraft && source.value !== latest;
+    form.hidden = !available && !hasDraft;
+    form.querySelector('button[type="submit"]').disabled = !available || stale || !!form.dataset.submitting;
+    const notice = form.querySelector('[data-resume-notice]');
+    notice.hidden = !hasDraft || (available && !stale);
+    notice.textContent = stale
+      ? 'Une autre exécution a commencé. Vos retours sont conservés : relisez sa nouvelle activité avant de les appliquer à cette exécution.'
+      : 'La reprise est actuellement indisponible. Vos retours sont conservés.';
+    const retarget = form.querySelector('[data-resume-retarget]');
+    retarget.hidden = !stale || !available;
+    retarget.disabled = !!form.dataset.submitting;
+  }
+
   function restoreFocus(focused, root) {
     if (!focused) return;
     const twin = [...root.querySelectorAll(focused.tagName)].find((el) => el.textContent === focused.textContent);
@@ -312,7 +336,8 @@
   }
 
   // The activity panel is replaced as a whole; the card form beside it is never touched, so a
-  // draft in progress survives the agent's stream of events.
+  // draft in progress survives the agent's stream of events. The feedback form is also
+  // outside the replaced panel; only its availability is refreshed.
   async function refreshActivity() {
     const current = activityElement();
     if (!dialog.open || !current || !lastOpenedCardId) return;
@@ -330,6 +355,7 @@
       const openDetails = [...live.querySelectorAll('details[open]')].map((d) => d.querySelector('summary').textContent);
       const focused = live.contains(document.activeElement) ? document.activeElement : null;
       live.replaceWith(next);
+      syncResumeForm();
       for (const details of next.querySelectorAll('details')) {
         if (openDetails.includes(details.querySelector('summary').textContent)) details.open = true;
       }
@@ -360,8 +386,50 @@
     refresh();
   });
 
+  dialog.addEventListener('input', (event) => {
+    if (event.target.matches('#resume-body')) syncResumeForm();
+  });
+
+  dialog.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-resume-retarget]');
+    if (!button) return;
+    const form = button.form;
+    const state = activityElement()?.querySelector('[data-resume-state]');
+    if (form.dataset.submitting || state?.dataset.available !== 'true') return;
+    form.elements.source_run_id.value = state.dataset.sourceRunId;
+    form.querySelector('.form__error').hidden = true;
+    syncResumeForm();
+    form.elements.body.focus();
+  });
+
+  dialog.addEventListener('submit', async (event) => {
+    const form = event.target;
+    if (!form.matches('form[data-resume-form]')) return;
+    event.preventDefault();
+    if (form.dataset.submitting || form.querySelector('button[type="submit"]').disabled) return;
+    const field = form.elements.body;
+    const errorBox = form.querySelector('.form__error');
+    const sent = field.value;
+    errorBox.hidden = true;
+    form.dataset.submitting = 'true';
+    syncResumeForm();
+    try {
+      await post(form.action, new URLSearchParams(new FormData(form)));
+      if (field.value === sent) field.value = '';
+      refreshThread();
+      refresh();
+    } catch (error) {
+      errorBox.textContent = error.message;
+      errorBox.hidden = false;
+    } finally {
+      delete form.dataset.submitting;
+      syncResumeForm();
+      refreshActivity();
+    }
+  });
+
   dialog.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && event.target.matches('#comment-body')) {
+    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && event.target.matches('#comment-body, #resume-body')) {
       event.preventDefault();
       event.target.form.requestSubmit();
     }
@@ -411,6 +479,7 @@
     lastOpenedCardId = link.closest('.card').dataset.cardId;
     dialog.showModal();
     localizeTimes(dialogBody);
+    syncResumeForm();
     const firstEvents = dialogBody.querySelector('.activity__events');
     if (firstEvents) firstEvents.scrollTop = firstEvents.scrollHeight;
     dialogBody.querySelector('input[name="title"]')?.focus();

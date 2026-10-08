@@ -224,6 +224,28 @@ impl Github {
         }
     }
 
+    /// Continues the PR already associated with a card. A closed or retargeted PR
+    /// must never turn a resumed session into a silently created replacement PR.
+    pub async fn ensure_existing(
+        &self,
+        cwd: &Path,
+        number: i64,
+        branch: &str,
+        base: &str,
+        expected_head: &str,
+    ) -> Result<PullRequest, String> {
+        let pr = self.refresh(cwd, number).await?;
+        Self::check_branches(&pr, branch, base)?;
+        if pr.head_sha != expected_head {
+            return Err("La PR ne porte pas le commit vérifié de la reprise.".to_owned());
+        }
+        let ready = self.ready(cwd, pr, branch, base).await?;
+        if ready.head_sha != expected_head {
+            return Err("Le commit de la PR a changé pendant sa publication.".to_owned());
+        }
+        Ok(ready)
+    }
+
     pub async fn refresh(&self, cwd: &Path, number: i64) -> Result<PullRequest, String> {
         if number <= 0 {
             return Err("Le numéro de PR est invalide.".to_owned());
@@ -859,5 +881,69 @@ mod tests {
         let persisted = serde_json::to_string(&pr).unwrap();
         assert_eq!(serde_json::from_str::<PullRequest>(&persisted).unwrap(), pr);
         assert!(f.github.merge(&f.cwd, 7, OTHER_HEAD, "main").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn continuing_a_pr_uses_its_number_without_discovery_or_creation() {
+        let f = Fixture::new();
+        let pr = f
+            .github
+            .ensure_existing(&f.cwd, 7, "helm/CARD-1", "main", HEAD)
+            .await
+            .unwrap();
+        assert_eq!(pr.number, 7);
+        assert_eq!(f.read("commands.log"), "view\n");
+    }
+
+    #[tokio::test]
+    async fn continuing_a_pr_rejects_changed_identity_state_branch_base_and_head() {
+        for (field, value) in [
+            ("number", json!(8)),
+            ("url", json!("https://github.com/other/repo/pull/7")),
+            ("state", json!("CLOSED")),
+            ("state", json!("MERGED")),
+            ("headRefName", json!("helm/other")),
+            ("baseRefName", json!("develop")),
+            ("headRefOid", json!(OTHER_HEAD)),
+            ("isCrossRepository", json!(true)),
+        ] {
+            let f = Fixture::new();
+            let mut pr = raw_pr();
+            pr[field] = value;
+            pr["isDraft"] = json!(true);
+            f.json("view.json", &pr);
+            assert!(
+                f.github
+                    .ensure_existing(&f.cwd, 7, "helm/CARD-1", "main", HEAD)
+                    .await
+                    .is_err(),
+                "{field}"
+            );
+            assert_eq!(f.read("commands.log"), "view\n", "{field}");
+        }
+    }
+
+    #[tokio::test]
+    async fn continuing_a_draft_readies_only_the_expected_pr_and_rechecks_its_head() {
+        for changed in [false, true] {
+            let f = Fixture::new();
+            let mut draft = raw_pr();
+            draft["isDraft"] = json!(true);
+            f.json("view.json", &draft);
+            let mut ready = raw_pr();
+            if changed {
+                ready["headRefOid"] = json!(OTHER_HEAD);
+            }
+            f.json("after-ready.json", &ready);
+            let result = f
+                .github
+                .ensure_existing(&f.cwd, 7, "helm/CARD-1", "main", HEAD)
+                .await;
+            assert_eq!(result.is_ok(), !changed);
+            if let Ok(pr) = result {
+                assert!(!pr.draft);
+            }
+            assert_eq!(f.read("commands.log"), "view\nready\nview\n");
+        }
     }
 }

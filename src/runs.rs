@@ -321,6 +321,7 @@ pub struct Run {
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
     pub pushed_at: Option<i64>,
+    pub resumed_from: Option<RunId>,
 }
 
 impl Run {
@@ -352,7 +353,7 @@ impl Run {
 
 const RUN_COLUMNS: &str = "id, card_id, agent, model, permission_mode, status, prompt, session_id,
     worktree_path, branch, pid, exit_code, error, stderr, cost_usd, tokens_in, tokens_out,
-    queued_at, started_at, finished_at, pushed_at";
+    queued_at, started_at, finished_at, pushed_at, resumed_from";
 
 fn run_from_row(row: &Row<'_>) -> rusqlite::Result<Run> {
     Ok(Run {
@@ -377,6 +378,7 @@ fn run_from_row(row: &Row<'_>) -> rusqlite::Result<Run> {
         started_at: row.get(18)?,
         finished_at: row.get(19)?,
         pushed_at: row.get(20)?,
+        resumed_from: row.get(21)?,
     })
 }
 
@@ -391,11 +393,28 @@ pub struct NewRun<'a> {
 }
 
 /// Queues a run. `None` means the card already has an active run: its slot is taken.
-pub fn enqueue(conn: &mut Connection, new: &NewRun<'_>) -> Result<Option<RunId>> {
+pub fn enqueue(conn: &Connection, new: &NewRun<'_>) -> Result<Option<RunId>> {
+    insert_queued(conn, new, None)
+}
+
+/// Queues a continuation; caller validates the source and owns the surrounding transaction.
+pub fn enqueue_resumed(
+    conn: &Connection,
+    new: &NewRun<'_>,
+    source: RunId,
+) -> Result<Option<RunId>> {
+    insert_queued(conn, new, Some(source))
+}
+
+fn insert_queued(
+    conn: &Connection,
+    new: &NewRun<'_>,
+    resumed_from: Option<RunId>,
+) -> Result<Option<RunId>> {
     let id = conn
         .query_row(
-            "INSERT INTO agent_runs (card_id, agent, model, permission_mode, prompt)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO agent_runs (card_id, agent, model, permission_mode, prompt, resumed_from)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT (card_id) WHERE status IN ('queued', 'running') DO NOTHING
              RETURNING id",
             (
@@ -404,6 +423,7 @@ pub fn enqueue(conn: &mut Connection, new: &NewRun<'_>) -> Result<Option<RunId>>
                 new.model,
                 new.permission_mode,
                 new.prompt,
+                resumed_from,
             ),
             |row| row.get(0),
         )

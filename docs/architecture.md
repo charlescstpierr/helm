@@ -40,9 +40,10 @@ navigateur ──HTTP──▶ axum (routes.rs) ──▶ store.rs ──▶ SQL
 | `mentions.rs`   | Reconnaissance des `@mentions` : cibles connues et scanner pur.             |
 | `routes.rs`     | Pages, formulaires, flux SSE, garde-fous de requête.                        |
 | `runs.rs`       | Exécutions d'agent : machine à états, journal d'événements, opérations de stockage. |
+| `resume.rs`     | Conditions de reprise, résolution de la session et mise en file atomique avec le commentaire. |
 | `agent.rs`      | Vocabulaire commun : agent, modèle, mode de permission.                     |
 | `adapter.rs`    | `AgentAdapter` : ligne de commande d'un CLI et lecture de son flux (`ClaudeAdapter`). |
-| `supervisor.rs` | `Orchestrator` (mise en file, annulation) et `Supervisor` (processus, worktree, vérifications, push, publication de PR). |
+| `supervisor.rs` | `Orchestrator` (mise en file, reprise, annulation) et `Supervisor` (processus, worktree, vérifications, push, publication de PR). |
 | `git.rs`        | Worktrees, comptage de commits et push, par appel au binaire `git`.         |
 | `checks.rs`     | Exécution des commandes locales et stockage de leurs résultats par commit et exécution. |
 | `process.rs`    | Commandes externes avec délai maximal, sorties bornées et arrêt du groupe de processus. |
@@ -185,7 +186,7 @@ projects 1──* board_columns 1──* cards *──* labels
   | `status`          | `queued`, `running`, `succeeded`, `failed`, `cancelled`, `interrupted`. |
   | `prompt`          | Consigne envoyée (pour l'audit et la relance).                     |
   | `session_id`      | Identifiant de session rendu par le CLI, clé de la reprise.        |
-  | `resumed_from`    | Exécution précédente, quand celle-ci en reprend une (réservé).     |
+  | `resumed_from`    | Exécution précédente, quand celle-ci en reprend une ; les tentatives restent distinctes. |
   | `worktree_path`, `branch` | Worktree git isolé de la carte.                            |
   | `pid`, `exit_code`| Suivi du processus.                                                |
   | `error`, `stderr` | Pourquoi l'exécution a échoué ; sortie d'erreur du CLI, à part.    |
@@ -217,8 +218,9 @@ projects 1──* board_columns 1──* cards *──* labels
 - `card_pull_requests` conserve un instantané par carte : `card_id`, `run_id`, `repository`,
   `number`, `expected_base`, `snapshot` JSON, `refreshed_at` et `error`. Le couple dépôt et
   numéro de PR est unique. L'instantané contient l'état, le commit, les branches, les contrôles
-  CI et les conditions de fusion renvoyés par GitHub. Une actualisation conserve la base
-  attendue. Si la lecture de GitHub échoue, Helm garde le dernier instantané et enregistre l'erreur.
+  CI et les conditions de fusion renvoyés par GitHub. Une actualisation ou une reprise conserve
+  la base attendue de la même PR. Si la lecture de GitHub échoue, Helm garde le dernier instantané
+  et enregistre l'erreur.
 
 Les résultats disparaissent en cascade avec l'exécution ou la carte. Une PR peut rester liée
 à une exécution précédente après une relance : l'interface l'indique et bloque sa fusion.
@@ -261,12 +263,14 @@ catégorie déclenche et reflète le travail des agents :
 | `todo` → `in_progress`             | orchestrateur      | Worktree créé, processus lancé (`running`).               |
 | `in_progress` → `in_review`        | orchestrateur      | L'agent a terminé avec succès et la branche est poussée sur `origin`. |
 | `in_progress` (reste)              | orchestrateur      | Échec, annulation ou interruption : la carte ne bouge pas, l'erreur est dans l'activité de la carte et dans son fil (commentaire du système, qui n'enregistre jamais de mention). |
-| `in_review` → `todo`               | humain             | Nouvelle exécution (la reprise de session viendra ensuite). |
+| `in_review` → `todo`               | humain             | Nouvelle exécution dans une nouvelle session. |
+| carte non terminée → `in_progress` | reprise explicite  | Le commentaire de correction met une nouvelle exécution en file ; le superviseur reprend la session existante quand une place se libère. |
 | `in_review` → `done`               | humain             | Travail accepté ; le worktree peut être nettoyé (à la main pour l'instant). |
 | carte → `done`                     | livraison GitHub   | GitHub confirme la fusion de la PR de la dernière exécution, en état `succeeded`, avec le commit vérifié et les branches attendues. |
 
-Seule l'*entrée* dans une colonne `todo` déclenche : enregistrer le formulaire d'une carte déjà
-là, ou la réordonner dans la colonne, ne relance rien.
+Pour un déplacement, seule l'*entrée* dans une colonne `todo` déclenche : enregistrer le formulaire
+d'une carte déjà là, ou la réordonner dans la colonne, ne relance rien. Le formulaire de reprise
+est une action distincte. Ajouter un commentaire ordinaire ou une `@mention` ne lance aucun agent.
 
 L'agent ne décide pas de la fusion. L'humain la demande dans Helm ou sur GitHub, puis Helm
 actualise la carte après confirmation. Déplacer manuellement une carte vers `done` reste
@@ -278,11 +282,11 @@ possible et ne déclenche aucune fusion.
 
 Par défaut, un agent est un **processus sans interface**, enfant de Helm. Livré : Claude,
 dont la consigne passe par l'entrée standard (elle peut contenir tout le fil de commentaires).
-Prévu : la reprise et Codex.
+La reprise de session Claude est livrée. Codex reste prévu.
 
 ```
 claude -p --output-format stream-json --verbose --permission-mode <mode> [--model <m>]   # livré
-claude -p … --resume <session_id>                       # prévu
+claude -p … --resume <session_id>                       # livré
 codex exec --json "<consigne>"                          # prévu ; reprise : codex exec resume <session_id>
 ```
 
@@ -299,10 +303,10 @@ codex exec --json "<consigne>"                          # prévu ; reprise : cod
   conservée à part pour le diagnostic (`agent_runs.stderr`, 256 Kio au plus). Une ligne de plus
   de 1 Mio est tronquée à la lecture et signalée dans le journal, sans interrompre l'exécution. Les nouvelles
   lignes sont annoncées aux navigateurs au plus quatre fois par seconde par exécution.
-- **Reprise par identifiant de session, prévue.** Le `session_id` émis par le CLI est enregistré dès
-  qu'il apparaît. Relancer après des retours de revue, un échec ou un redémarrage de Helm
-  crée une **nouvelle** exécution (`resumed_from`) qui reprend la même session dans le même
-  worktree : le contexte de l'agent est conservé, l'historique des tentatives aussi.
+- **Reprise par identifiant de session.** Le `session_id` émis par le CLI est enregistré dès
+  qu'il apparaît. Le formulaire de correction crée une nouvelle exécution qui reprend cette
+  session selon le contrat de [`claude --resume`](https://code.claude.com/docs/en/cli-reference).
+  Les conditions et le stockage sont détaillés ci-dessous.
 - **Supervision.** Les processus sont lancés avec `tokio::process` et attendus de façon
   asynchrone ; une limite de concurrence configurable borne le nombre d'agents simultanés.
   Un arrêt normal de Helm (SIGINT, SIGTERM) arrête chaque agent comme une annulation (SIGTERM au
@@ -334,6 +338,36 @@ Un trait `AgentAdapter` isole ce qui diffère entre CLI : construire la commande
 reprise), reconnaître l'identifiant de session, traduire chaque ligne en événement normalisé,
 détecter la fin et son issue. Ajouter un agent, c'est écrire un adaptateur.
 
+### Reprise après des retours
+
+`POST /cards/{id}/resume` reçoit le texte de correction et `source_run_id`, l'exécution affichée
+lors de la demande. L'orchestrateur vérifie à nouveau que cette exécution est la dernière,
+qu'elle est terminée et que la carte n'est pas dans `done`. L'agent assigné doit correspondre
+à celui de la session. La même restriction loopback et la même réservation par carte que pour
+les autres lancements s'appliquent.
+
+Le commentaire humain et l'exécution `queued` sont enregistrés dans une seule transaction.
+Un formulaire périmé, une demande répétée ou une autre exécution active ne laisse donc pas de
+commentaire sans reprise associée. La nouvelle ligne pointe vers la précédente via
+`resumed_from`, déjà présent dans la migration `0004`. Elle conserve le modèle et le mode de
+permission précédents, ainsi qu'une consigne figée lors de la demande ; les tentatives et leurs
+vérifications restent distinctes. Une reprise annulée avant d'avoir reçu
+un identifiant de session peut remonter cette chaîne pour retrouver la session antérieure.
+La mise en file n'exige pas de déplacer la carte vers `todo` ; le superviseur la passe en
+`in_progress` lorsqu'il prend l'exécution.
+
+La reprise réutilise le worktree enregistré et vérifie qu'il appartient au dépôt et porte
+la branche attendue. Elle ne recrée pas un répertoire disparu et ne supprime pas de travail
+non commité. Le contrôle des processus orphelins reste applicable. Un historique de session
+indisponible pour Claude produit un échec visible, sans nouvelle session de secours. Une
+entrée explicite dans `todo` conserve son comportement de lancement neuf.
+
+Après la reprise, les vérifications, le push et la publication suivent le même parcours que
+pour un lancement neuf. Une PR enregistrée reste attachée à son dépôt, son numéro et sa base ;
+la publication relit cette PR précise et refuse un état fermé, fusionné ou une base modifiée.
+Les résultats de l'exécution précédente ne permettent plus de fusionner dès qu'une nouvelle
+exécution existe.
+
 ### Vérifications locales avant publication
 
 `[checks]` configure une liste `commands` et un `timeout_minutes`, de 10 minutes par commande
@@ -362,6 +396,11 @@ branches attendues. Une PR en brouillon devient prête à relire. La base vient 
 de la branche par défaut du dépôt dans `git.rs`. Lors de la création, le corps transmis sur
 stdin indique le SHA et les résultats de Helm. Une PR réutilisée conserve son corps existant.
 L'identité et l'URL de la PR sont validées avant stockage.
+
+Une reprise avec une PR déjà liée conserve cette identité et sa base attendue même quand
+`run_id` change. Helm vérifie la PR enregistrée par numéro au lieu de rechercher une autre PR
+sur la branche. Une fermeture, une fusion ou un changement de base est signalé ; aucune PR
+de remplacement n'est créée automatiquement.
 
 Une erreur ou une annulation pendant la publication de la PR ne remet pas en cause le push
 réussi. L'exécution se termine en `succeeded`, avec un commentaire expliquant le problème.
@@ -407,9 +446,10 @@ coordination passe par des objets du tableau, visibles et historisés :
 
 - **Commentaires** — un agent rend compte, pose une question, laisse une note de passation.
   Le stockage et l'affichage sont livrés (section 3) ; seul l'humain écrit pour l'instant.
-- **Mentions** — `@codex` dans un commentaire crée une mention non traitée (livré) ; l'orchestrateur
-  la transforme en exécution (ou en reprise) de l'agent visé, sur cette carte, avec le fil de
-  commentaires comme contexte. `@moi` bloque la carte en attente de l'humain.
+- **Mentions** — `@codex` dans un commentaire crée une mention non traitée (livré). Leur
+  traitement automatique reste **prévu** : l'orchestrateur transformerait une mention en
+  exécution ou reprise avec le fil comme contexte, et `@moi` bloquerait la carte en attente
+  de l'humain. Aujourd'hui, une reprise exige le formulaire explicite de correction.
 - **Sous-cartes** — pour déléguer, un agent crée une carte fille ; elle suit son propre cycle
   de vie, dans son propre worktree. La carte mère voit l'avancement de ses filles.
 
@@ -436,6 +476,12 @@ conversation, et remplacer un agent par un autre ne change pas le protocole.
   fragment ; le script le recharge à chaque événement SSE sans toucher au formulaire. Sans
   JavaScript, la page de la carte porte le même panneau et le bouton d'annulation est un
   formulaire.
+- **Retours et reprise.** « Demander une correction » contient les « Retours pour l'agent » et
+  le bouton « Reprendre avec ces retours ». Le serveur revalide l'exécution source au POST.
+  Une réussite redirige vers la carte sans JavaScript ; avec le script, le panneau est rechargé.
+  Le script conserve un brouillon de correction lors des actualisations SSE et après un échec
+  de l'envoi. Si une autre exécution devient la dernière pendant la saisie, il bloque le bouton
+  et invite à revoir la demande, au lieu de changer silencieusement l'exécution à reprendre.
 - **Vérifications et PR.** Le même panneau affiche le commit vérifié, chaque commande et ses
   sorties, le lien de PR, son état, la CI et la dernière actualisation. Les actions sont des
   POST sous `/cards/{id}/pull-request/`, avec les suffixes `publish`, `refresh` et `merge`. Le serveur valide

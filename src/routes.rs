@@ -22,6 +22,7 @@ use crate::checks::{self, Verification, VerificationStatus};
 use crate::config::RunGate;
 use crate::db::Db;
 use crate::delivery::{self, CardPullRequest, Delivery};
+use crate::resume;
 use crate::runs::{self, Activity, Run, RunId, RunStatus};
 use crate::store::{self, Author, Board, Card, CardInput, Comment, StoreError};
 use crate::supervisor::Orchestrator;
@@ -142,6 +143,7 @@ pub fn router(state: AppState) -> Router {
             get(comment_thread).post(add_comment),
         )
         .route("/cards/{id}/activity", get(card_activity))
+        .route("/cards/{id}/resume", post(resume_run))
         .route(
             "/cards/{id}/pull-request/publish",
             post(publish_pull_request),
@@ -179,6 +181,7 @@ impl From<StoreError> for AppError {
         match &e {
             StoreError::NotFound => Self::NotFound,
             StoreError::Invalid(message) => Self::Invalid(message.clone()),
+            StoreError::Conflict(message) => Self::Conflict(message.clone()),
             StoreError::IllegalTransition { .. } => Self::Conflict(e.to_string()),
             StoreError::Db(e) => Self::Internal(e.to_string()),
         }
@@ -324,6 +327,7 @@ struct CardEditPage {
     verification: Option<Verification>,
     delivery: Option<CardPullRequest>,
     github_enabled: bool,
+    resume_available: bool,
     agents: AgentsView,
 }
 
@@ -337,6 +341,7 @@ struct CardPanelFragment {
     verification: Option<Verification>,
     delivery: Option<CardPullRequest>,
     github_enabled: bool,
+    resume_available: bool,
     agents: AgentsView,
 }
 
@@ -347,6 +352,7 @@ struct ActivityFragment {
     verification: Option<Verification>,
     delivery: Option<CardPullRequest>,
     github_enabled: bool,
+    resume_available: bool,
 }
 
 fn can_publish(
@@ -423,7 +429,7 @@ async fn edit_card(
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> AppResult<Html<String>> {
-    let (board, card, comments, activity, verification, delivery) = state
+    let (board, card, comments, activity, verification, delivery, resume_available) = state
         .db
         .call(move |conn| {
             let activity = runs::activity(conn, id)?;
@@ -440,11 +446,13 @@ async fn edit_card(
                 activity,
                 verification,
                 delivery::get(conn, id)?,
+                resume::available(conn, id)?,
             ))
         })
         .await?;
     let agents = state.agents();
     let github_enabled = state.github_enabled();
+    let resume_available = resume_available && state.orchestrator.gate() == RunGate::Open;
     let html = if is_fetch(&headers) {
         CardPanelFragment {
             board,
@@ -454,6 +462,7 @@ async fn edit_card(
             verification,
             delivery,
             github_enabled,
+            resume_available,
             agents,
         }
         .render()?
@@ -466,6 +475,7 @@ async fn edit_card(
             verification,
             delivery,
             github_enabled,
+            resume_available,
             agents,
         }
         .render()?
@@ -477,7 +487,7 @@ async fn card_activity(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> AppResult<Html<String>> {
-    let (activity, verification, delivery) = state
+    let (activity, verification, delivery, resume_available) = state
         .db
         .call(move |conn| {
             store::get_card(conn, id)?;
@@ -488,7 +498,12 @@ async fn card_activity(
                 .map(|run| checks::get(conn, run.id))
                 .transpose()?
                 .flatten();
-            Ok::<_, StoreError>((activity, verification, delivery::get(conn, id)?))
+            Ok::<_, StoreError>((
+                activity,
+                verification,
+                delivery::get(conn, id)?,
+                resume::available(conn, id)?,
+            ))
         })
         .await?;
     Ok(Html(
@@ -497,6 +512,7 @@ async fn card_activity(
             verification,
             delivery,
             github_enabled: state.github_enabled(),
+            resume_available: resume_available && state.orchestrator.gate() == RunGate::Open,
         }
         .render()?,
     ))
@@ -663,6 +679,38 @@ async fn cancel_run(
     } else {
         Ok(Redirect::to(&format!("/cards/{card_id}/edit")).into_response())
     }
+}
+
+#[derive(Deserialize)]
+struct ResumeForm {
+    source_run_id: i64,
+    body: String,
+}
+
+async fn resume_run(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Form(form): Form<ResumeForm>,
+) -> AppResult<Response> {
+    if state.orchestrator.gate() != RunGate::Open {
+        return Ok((
+            StatusCode::METHOD_NOT_ALLOWED,
+            state
+                .orchestrator
+                .gate()
+                .notice()
+                .unwrap_or("Agents désactivés."),
+        )
+            .into_response());
+    }
+    let orchestrator = state.orchestrator.clone();
+    state
+        .db
+        .call(move |conn| orchestrator.resume(conn, id, RunId(form.source_run_id), &form.body))
+        .await?;
+    state.board_changed();
+    Ok(delivery_written(&headers, id))
 }
 
 async fn publish_pull_request(
@@ -1272,6 +1320,192 @@ mod tests {
             post_form(&app, "/runs/99/cancel", "").await,
             StatusCode::NOT_FOUND
         );
+    }
+
+    async fn prepare_resumable_run(app: &Router, db: &Db) -> RunId {
+        assert_eq!(
+            post_form(app, "/cards", "column_id=2&title=Task&agent=claude").await,
+            StatusCode::NO_CONTENT
+        );
+        db.call(|conn| {
+            let run = runs::claim_next_queued(conn)?.unwrap();
+            runs::record_workspace(conn, run.id, "/worktrees/HELM-1", "helm/HELM-1")?;
+            runs::record_session(conn, run.id, "session-42")?;
+            runs::finish(conn, run.id, &runs::Outcome::Succeeded)?;
+            store::move_card(conn, run.card_id, 4, 0)?;
+            Ok::<_, StoreError>(run.id)
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn feedback_resumes_from_a_plain_form_and_renders_escaped_comments_and_lineage() {
+        let (app, db) = wired_app();
+        let source = prepare_resumable_run(&app, &db).await;
+        let (_, _, page) = send(&app, get("/cards/1/edit")).await;
+        assert!(
+            page.contains("data-resume-form>"),
+            "eligible form is visible: {page}"
+        );
+        assert!(page.contains("name=\"source_run_id\" value=\"1\""));
+        assert!(page.contains("data-available=\"true\""));
+        assert!(page.contains("Reprendre avec ces retours"));
+        assert!(page.contains("action=\"/cards/1/comments\""));
+        let (_, _, activity) = send(&app, get("/cards/1/activity")).await;
+        assert!(
+            !activity.contains("data-resume-form"),
+            "refresh must not replace the draft"
+        );
+        assert!(!activity.contains("textarea"));
+
+        let (status, headers, _) = send(
+            &app,
+            post("/cards/1/resume")
+                .body(Body::from(
+                    "source_run_id=1&body=Corrige+%3Cscript%3Ex%3C%2Fscript%3E+%40claude",
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(headers[header::LOCATION], "/cards/1/edit#run-activity");
+        db.call(move |conn| {
+            let run = runs::latest_run(conn, 1)?.unwrap();
+            assert_eq!(run.resumed_from, Some(source));
+            assert_eq!(run.status, RunStatus::Queued);
+            let comments = store::list_comments(conn, 1)?;
+            assert_eq!(comments.len(), 1);
+            assert_eq!(comments[0].author, Author::moi());
+            assert_eq!(comments[0].body, "Corrige <script>x</script> @claude");
+            Ok::<_, StoreError>(())
+        })
+        .await
+        .unwrap();
+        let (_, _, page) = send(&app, get("/cards/1/edit")).await;
+        assert!(page.contains("Reprise de l’exécution 1"));
+        assert!(page.contains("data-resume-form hidden"));
+        assert!(page.contains("data-available=\"false\""));
+        assert!(page.contains("&lt;script&gt;") || page.contains("&#60;script&#62;"));
+        assert!(!page.contains("<script>x"));
+    }
+
+    #[tokio::test]
+    async fn a_resume_fetch_wakes_open_browsers_and_repeated_or_stale_posts_write_nothing() {
+        let (app, db) = wired_app();
+        prepare_resumable_run(&app, &db).await;
+        let response = app.clone().oneshot(get("/events")).await.unwrap();
+        let mut stream = response.into_body();
+        assert_eq!(
+            post_form(
+                &app,
+                "/cards/1/resume",
+                "source_run_id=1&body=Première+correction"
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+        let frame = tokio::time::timeout(Duration::from_secs(5), stream.frame())
+            .await
+            .expect("a resume notifies open browsers")
+            .unwrap()
+            .unwrap();
+        assert!(
+            String::from_utf8(frame.into_data().unwrap().to_vec())
+                .unwrap()
+                .contains("event: board")
+        );
+        assert_eq!(
+            post_form(&app, "/cards/1/resume", "source_run_id=1&body=Duplicata").await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            post_form(&app, "/runs/2/cancel", "").await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            post_form(
+                &app,
+                "/cards/1/resume",
+                "source_run_id=1&body=Ancienne+page"
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(run_statuses(&db).await.len(), 2);
+        db.call(|conn| {
+            let comments = store::list_comments(conn, 1)?;
+            assert_eq!(
+                comments
+                    .iter()
+                    .filter(|comment| comment.author == Author::moi())
+                    .count(),
+                1
+            );
+            assert!(
+                !comments
+                    .iter()
+                    .any(|comment| comment.body.contains("Duplicata")
+                        || comment.body.contains("Ancienne page"))
+            );
+            Ok::<_, StoreError>(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_cross_origin_closed_gates_and_blank_feedback_without_writes() {
+        let (app, db) = wired_app();
+        prepare_resumable_run(&app, &db).await;
+        let forged = post("/cards/1/resume")
+            .header(header::ORIGIN, "http://evil.example")
+            .body(Body::from("source_run_id=1&body=Forged"))
+            .unwrap();
+        assert_eq!(send(&app, forged).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(
+            post_form(&app, "/cards/1/resume", "source_run_id=1&body=+%0A+").await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            post_form(&app, "/cards/404/resume", "source_run_id=1&body=Missing").await,
+            StatusCode::NOT_FOUND
+        );
+        for gate in [RunGate::NoRepo, RunGate::NotLoopback] {
+            let closed = router(AppState::new(db.clone(), true, orchestrator(gate)));
+            assert_eq!(
+                post_form(&closed, "/cards/1/resume", "source_run_id=1&body=Denied").await,
+                StatusCode::METHOD_NOT_ALLOWED
+            );
+            let (_, _, page) = send(&closed, get("/cards/1/edit")).await;
+            assert!(page.contains("data-resume-form hidden"));
+            assert!(page.contains("data-available=\"false\""));
+        }
+        assert_eq!(run_statuses(&db).await.len(), 1);
+        db.call(|conn| {
+            assert!(store::list_comments(conn, 1)?.is_empty());
+            Ok::<_, StoreError>(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn commenting_on_a_resumable_card_does_not_start_work() {
+        let (app, db) = wired_app();
+        prepare_resumable_run(&app, &db).await;
+        assert_eq!(
+            post_form(&app, "/cards/1/comments", "body=%40claude+Corrige+le+titre").await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(run_statuses(&db).await, [(1, "succeeded".to_owned())]);
+        let mut request = get("/cards/1/edit");
+        request
+            .headers_mut()
+            .insert(FETCH_HEADER, HeaderValue::from_static("fetch"));
+        let (_, _, fragment) = send(&app, request).await;
+        assert!(fragment.contains("data-resume-form>"));
+        assert!(!fragment.contains("<html"));
     }
 
     #[tokio::test]

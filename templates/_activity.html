@@ -1,4 +1,5 @@
 <div class="activity" id="run-activity">
+  <span hidden data-resume-state data-available="{{ resume_available }}" data-source-run-id="{% if let Some(run) = activity.run %}{{ run.id }}{% endif %}"></span>
   {% if let Some(run) = activity.run %}
   <div class="activity__header">
     <span class="run-status" data-status="{{ run.status.slug() }}">{{ run.status.label() }}</span>
@@ -13,6 +14,7 @@
   <p class="form__error" role="alert">{{ error }}</p>
   {% endif %}
   <dl class="activity__facts">
+    {% if let Some(source) = run.resumed_from %}<div><dt>Reprise</dt><dd>Reprise de l’exécution {{ source }}</dd></div>{% endif %}
     {% if let Some(branch) = run.branch %}<div><dt>Branche</dt><dd><code>{{ branch }}</code>{% if run.pushed_at.is_some() %} (poussée sur origin){% endif %}</dd></div>{% endif %}
     {% if let Some(path) = run.worktree_path %}<div><dt>Worktree</dt><dd><code>{{ path }}</code></dd></div>{% endif %}
     {% if let Some(session) = run.session_id %}<div><dt>Session</dt><dd><code>{{ session }}</code></dd></div>{% endif %}

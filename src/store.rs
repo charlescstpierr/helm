@@ -36,6 +36,8 @@ pub enum StoreError {
     NotFound,
     /// The request is well-formed but breaks a rule; the message is shown to the user.
     Invalid(String),
+    /// The card or run changed, so the requested action no longer applies.
+    Conflict(String),
     /// A run was asked to change state in a way the state machine forbids.
     IllegalTransition {
         from: RunStatus,
@@ -49,6 +51,7 @@ impl fmt::Display for StoreError {
         match self {
             Self::NotFound => f.write_str("not found"),
             Self::Invalid(message) => f.write_str(message),
+            Self::Conflict(message) => f.write_str(message),
             Self::IllegalTransition { from, to } => {
                 write!(f, "a {} run cannot become {}", from.slug(), to.slug())
             }
@@ -595,8 +598,8 @@ fn column_project(tx: &Transaction<'_>, column_id: i64) -> Result<Option<i64>> {
 }
 
 /// Returns `(project_id, column_id)` of a card.
-fn card_location(tx: &Transaction<'_>, id: i64) -> Result<(i64, i64)> {
-    tx.query_row(
+fn card_location(conn: &Connection, id: i64) -> Result<(i64, i64)> {
+    conn.query_row(
         "SELECT project_id, column_id FROM cards WHERE id = ?1",
         [id],
         |row| Ok((row.get(0)?, row.get(1)?)),
@@ -823,6 +826,19 @@ pub fn add_comment(
     author: &Author,
     body: &str,
 ) -> Result<i64> {
+    let tx = conn.transaction()?;
+    let comment_id = add_comment_in_transaction(&tx, card_id, author, body)?;
+    tx.commit()?;
+    Ok(comment_id)
+}
+
+/// Shares normalization and mention recording with workflows that already own a transaction.
+pub(crate) fn add_comment_in_transaction(
+    conn: &Connection,
+    card_id: i64,
+    author: &Author,
+    body: &str,
+) -> Result<i64> {
     let body = body.replace("\r\n", "\n");
     let body = body.trim_start_matches('\n').trim_end();
     if body.trim().is_empty() {
@@ -833,24 +849,22 @@ pub fn add_comment(
             "Le commentaire dépasse {MAX_COMMENT_CHARS} caractères."
         ));
     }
-    let tx = conn.transaction()?;
-    card_location(&tx, card_id)?;
-    tx.execute(
+    card_location(conn, card_id)?;
+    conn.execute(
         "INSERT INTO comments (card_id, author_kind, author, body) VALUES (?1, ?2, ?3, ?4)",
         (card_id, author.kind, &author.name, body),
     )?;
-    let comment_id = tx.last_insert_rowid();
+    let comment_id = conn.last_insert_rowid();
     let targets = match author.kind {
         AuthorKind::System => Vec::new(),
         AuthorKind::Human | AuthorKind::Agent => mentions::mentioned_targets(body),
     };
     for target in targets {
-        tx.execute(
+        conn.execute(
             "INSERT INTO mentions (comment_id, target) VALUES (?1, ?2)",
             (comment_id, target.slug()),
         )?;
     }
-    tx.commit()?;
     Ok(comment_id)
 }
 

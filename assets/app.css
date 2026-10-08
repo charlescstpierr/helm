@@ -191,6 +191,13 @@ textarea {
   color: var(--color-text-muted);
 }
 
+.button:disabled {
+  border-color: var(--color-border);
+  background: var(--color-surface-sunken);
+  color: var(--color-text-muted);
+  cursor: not-allowed;
+}
+
 .input {
   width: 100%;
   min-height: var(--control-height);
