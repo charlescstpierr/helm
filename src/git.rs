@@ -173,10 +173,18 @@ pub async fn prepare_worktree(
     Ok(Worktree { path, branch })
 }
 
-/// Commits on the worktree's branch that the default branch does not have.
-pub async fn commits_ahead(repo: &Path, worktree: &Path) -> Result<u64> {
-    let base = default_branch(repo).await?;
-    let count = git(worktree, &["rev-list", "--count", &format!("{base}..HEAD")]).await?;
+/// The commit the worktree is on.
+pub async fn head(worktree: &Path) -> Result<String> {
+    git(worktree, &["rev-parse", "HEAD"]).await
+}
+
+/// Commits reachable from the worktree's HEAD but not from `since`: what a run added.
+pub async fn commits_since(worktree: &Path, since: &str) -> Result<u64> {
+    let count = git(
+        worktree,
+        &["rev-list", "--count", &format!("{since}..HEAD")],
+    )
+    .await?;
     count
         .parse()
         .map_err(|_| GitError(format!("unexpected commit count {count:?}")))
@@ -282,7 +290,6 @@ mod tests {
             run(&wt.path, &["symbolic-ref", "--short", "HEAD"]),
             "helm/HELM-3"
         );
-        assert_eq!(commits_ahead(&remote.repo, &wt.path).await.unwrap(), 0);
         assert_eq!(default_branch(&remote.repo).await.unwrap(), "main");
         // The main checkout stays on main and clean.
         assert_eq!(
@@ -306,7 +313,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(again, first);
-        assert_eq!(commits_ahead(&remote.repo, &again.path).await.unwrap(), 1);
 
         // The directory is deleted behind git's back; the branch and its commit survive.
         std::fs::remove_dir_all(&first.path).unwrap();
@@ -314,7 +320,28 @@ mod tests {
             .await
             .unwrap();
         assert!(revived.path.join("work.txt").exists());
-        assert_eq!(commits_ahead(&remote.repo, &revived.path).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn commits_are_counted_from_the_commit_a_run_started_at() {
+        let remote = Remote::new("git-since");
+        let wt = prepare_worktree(&remote.repo, &remote.worktrees, "HELM", 1)
+            .await
+            .unwrap();
+        std::fs::write(wt.path.join("first.txt"), "1").unwrap();
+        run(&wt.path, &["add", "."]);
+        run(&wt.path, &["commit", "-q", "-m", "first"]);
+
+        let started_at = head(&wt.path).await.unwrap();
+        assert_eq!(commits_since(&wt.path, &started_at).await.unwrap(), 0);
+
+        std::fs::write(wt.path.join("second.txt"), "2").unwrap();
+        run(&wt.path, &["add", "."]);
+        run(&wt.path, &["commit", "-q", "-m", "second"]);
+        assert_eq!(commits_since(&wt.path, &started_at).await.unwrap(), 1);
+
+        run(&wt.path, &["reset", "-q", "--hard", "HEAD~2"]);
+        assert_eq!(commits_since(&wt.path, &started_at).await.unwrap(), 0);
     }
 
     #[tokio::test]

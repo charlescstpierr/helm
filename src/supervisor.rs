@@ -428,6 +428,10 @@ impl Supervisor {
         )
         .await;
 
+        let started_at = match git::head(&worktree.path).await {
+            Ok(head) => head,
+            Err(e) => return Outcome::Failed(format!("HEAD du worktree illisible : {e}")),
+        };
         let mut child = match self.spawn_agent(run, &worktree.path) {
             Ok(child) => child,
             Err(e) => return Outcome::Failed(e),
@@ -463,7 +467,8 @@ impl Supervisor {
             return Outcome::Failed(why);
         }
 
-        self.publish_branch(id, &worktree, cancel).await
+        self.publish_branch(id, &worktree, &started_at, cancel)
+            .await
     }
 
     fn spawn_agent(&self, run: &Run, cwd: &std::path::Path) -> Result<Child, String> {
@@ -629,15 +634,17 @@ impl Supervisor {
         stderr
     }
 
-    /// After a clean agent run: the work must be committed, then it is pushed.
+    /// After a clean agent run: the run must have committed something new, then the branch is
+    /// pushed.
     async fn publish_branch(
         &self,
         id: RunId,
         worktree: &git::Worktree,
+        started_at: &str,
         cancel: &Notify,
     ) -> Outcome {
-        let ahead = git::commits_ahead(&self.config.repo, &worktree.path).await;
-        match ahead {
+        let added = git::commits_since(&worktree.path, started_at).await;
+        match added {
             Err(e) => {
                 return self
                     .fail(
@@ -1137,6 +1144,35 @@ mod tests {
             pushed.contains("HELLO.md") && !pushed.contains("LEFTOVER.md"),
             "{pushed}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_rerun_that_adds_no_commit_fails_even_though_the_branch_is_already_ahead() {
+        let h = Harness::new("sup-rerun");
+        let card = h.card("success", "").await;
+        let first = h.settled(card).await;
+        assert_eq!(first.status, RunStatus::Succeeded, "{:?}", first.error);
+
+        // Review sends the card back to "À faire"; the same task commits nothing new.
+        let orchestrator = h.orchestrator.clone();
+        h.db.call(move |conn| {
+            let entered = store::move_card(conn, card, 2, 0)?;
+            orchestrator.after_placement(conn, card, entered)
+        })
+        .await
+        .unwrap();
+        let second = h
+            .wait_for(card, |run| run.id != first.id && !run.status.is_active())
+            .await;
+
+        assert_eq!(second.status, RunStatus::Failed, "{:?}", second.error);
+        assert!(
+            second.error.as_deref().unwrap().contains("rien commiter"),
+            "{:?}",
+            second.error
+        );
+        assert!(second.pushed_at.is_none());
+        assert_eq!(h.column_category(card).await, Category::InProgress);
     }
 
     #[tokio::test]
