@@ -43,6 +43,9 @@ Tout est optionnel. Ordre de priorité : variables d'environnement, puis fichier
 Le fichier lu est `helm.toml` dans le répertoire courant s'il existe, ou celui désigné par
 `HELM_CONFIG`. Un `helm.toml` absent laisse les défauts ; un fichier présent mais illisible ou
 invalide (clé inconnue comprise), ou un `HELM_CONFIG` introuvable, fait échouer le démarrage.
+Les chemins relatifs de `project.repo` et `project.worktree_root` partent du répertoire où
+Helm est lancé. Un worktree existant n'est réutilisé que s'il appartient au dépôt configuré
+et se trouve sur la branche de la carte ; un dossier incompatible est refusé sans être écrasé.
 Modèle : [helm.example.toml](helm.example.toml).
 
 Helm n'a pas d'authentification : gardez l'écoute sur loopback, ou placez un proxy ou un VPN de
