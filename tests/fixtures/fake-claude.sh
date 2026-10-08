@@ -47,6 +47,12 @@ hang)
     sed -n 2p "$here/claude-success.jsonl"
     sleep 60
     ;;
+group_child)
+    sleep 300 &
+    echo $! > "$(pwd).child"
+    sed -n 2p "$here/claude-success.jsonl"
+    wait
+    ;;
 silent_success)
     commit
     ;;

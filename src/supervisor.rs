@@ -1219,6 +1219,42 @@ mod tests {
         ));
     }
 
+    fn gone(pid: i64) -> bool {
+        !process_exists(pid) || is_zombie(pid)
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_run_stops_every_process_of_the_agents_group() {
+        let h = Harness::new("sup-cancel-group");
+        let card = h.card("group_child", "").await;
+        let running = h.wait_for(card, |r| r.status == RunStatus::Running).await;
+        let marker = h.remote.worktrees.join("HELM-1.child");
+        let mut child = None;
+        for _ in 0..200 {
+            child = std::fs::read_to_string(&marker)
+                .ok()
+                .and_then(|text| text.trim().parse::<i64>().ok());
+            if child.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let child = child.expect("the agent started a child");
+        assert!(!gone(child), "the child runs before the cancel");
+
+        h.orchestrator.cancel(&h.db, running.id).await.unwrap();
+        let run = h.settled(card).await;
+
+        assert_eq!(run.status, RunStatus::Cancelled, "{:?}", run.error);
+        for _ in 0..200 {
+            if gone(child) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the agent's child {child} outlived the cancel");
+    }
+
     fn is_zombie(pid: i64) -> bool {
         std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| stat.contains(") Z "))
     }
