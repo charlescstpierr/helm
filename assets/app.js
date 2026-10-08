@@ -322,9 +322,15 @@
       const events = live.querySelector('.activity__events');
       const followTail = !events || events.scrollTop + events.clientHeight >= events.scrollHeight - 24;
       const openDetails = [...live.querySelectorAll('details[open]')].map((d) => d.querySelector('summary').textContent);
+      const focused = live.contains(document.activeElement) ? document.activeElement : null;
       live.replaceWith(next);
       for (const details of next.querySelectorAll('details')) {
         if (openDetails.includes(details.querySelector('summary').textContent)) details.open = true;
+      }
+      if (focused) {
+        // The panel is replaced as a whole, so the focused element is a new node: find its twin.
+        const twin = [...next.querySelectorAll(focused.tagName)].find((el) => el.textContent === focused.textContent);
+        twin?.focus({ preventScroll: true });
       }
       // Localised times change line wrapping, so scroll only once the layout is final.
       localizeTimes(next);
