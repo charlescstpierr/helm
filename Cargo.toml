@@ -10,11 +10,12 @@ publish = false
 askama = "0.16"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "form"] }
 futures-util = { version = "0.3", default-features = false }
+libc = "0.2"
 rusqlite = { version = "0.40", features = ["bundled"] }
 rust-embed = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "net", "sync", "signal", "macros", "time"] }
+tokio = { version = "1", features = ["rt", "net", "sync", "signal", "macros", "time", "process", "io-util", "fs"] }
 toml = { version = "1", default-features = false, features = ["parse", "serde"] }
 
 [dev-dependencies]

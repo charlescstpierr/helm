@@ -1,8 +1,6 @@
 //! HTTP surface: server-rendered pages, form endpoints, the SSE stream and request guards.
 
 use std::convert::Infallible;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use askama::Template;
@@ -15,13 +13,16 @@ use axum::routing::{get, post};
 use axum::{Form, Router};
 use futures_util::stream::{self, Stream};
 use serde::Deserialize;
-use tokio::sync::broadcast::{self, error::RecvError};
+use tokio::sync::broadcast::error::RecvError;
 
 use crate::agent::{Agent, ModelName};
 use crate::assets;
+use crate::changes::Changes;
 use crate::config::RunGate;
 use crate::db::Db;
+use crate::runs::RunId;
 use crate::store::{self, Author, Board, Card, CardInput, Comment, StoreError};
+use crate::supervisor::Orchestrator;
 
 /// Sent by `assets/app.js` on its own requests: the server then answers with a fragment or
 /// an empty 204 instead of a full page or a redirect.
@@ -33,12 +34,10 @@ const SSE_KEEP_ALIVE: Duration = Duration::from_secs(25);
 #[derive(Clone)]
 pub struct AppState {
     db: Db,
-    /// Carries the board revision after each change; subscribers just reload the board.
-    events: broadcast::Sender<u64>,
-    revision: Arc<AtomicU64>,
+    changes: Changes,
+    orchestrator: Orchestrator,
     /// When bound to loopback, only loopback `Host` names are served (DNS-rebinding guard).
     loopback_only: bool,
-    agents: AgentsView,
 }
 
 /// What the card form needs to know about the orchestrator: whether agents can be assigned
@@ -47,6 +46,15 @@ pub struct AppState {
 pub struct AgentsView {
     pub gate: RunGate,
     pub default_model: Option<ModelName>,
+}
+
+impl From<&Orchestrator> for AgentsView {
+    fn from(orchestrator: &Orchestrator) -> Self {
+        Self {
+            gate: orchestrator.gate(),
+            default_model: orchestrator.default_model().cloned(),
+        }
+    }
 }
 
 impl AgentsView {
@@ -59,6 +67,15 @@ impl AgentsView {
         self.gate.notice().unwrap_or("")
     }
 
+    /// Shown on the board itself, but only for the case that is a security problem rather
+    /// than simply an unconfigured feature.
+    pub fn banner(&self) -> &'static str {
+        match self.gate {
+            RunGate::NotLoopback => self.notice(),
+            RunGate::Open | RunGate::NoRepo => "",
+        }
+    }
+
     pub fn model_placeholder(&self) -> String {
         match &self.default_model {
             Some(model) => format!("Défaut du projet : {model}"),
@@ -68,21 +85,26 @@ impl AgentsView {
 }
 
 impl AppState {
-    pub fn new(db: Db, loopback_only: bool, agents: AgentsView) -> Self {
-        let (events, _) = broadcast::channel(16);
+    pub fn new(db: Db, loopback_only: bool, orchestrator: Orchestrator) -> Self {
         Self {
             db,
-            events,
-            revision: Arc::new(AtomicU64::new(0)),
+            changes: Changes::new(),
+            orchestrator,
             loopback_only,
-            agents,
         }
     }
 
+    /// The notifier the background supervisor shares with the handlers.
+    pub fn changes(&self) -> Changes {
+        self.changes.clone()
+    }
+
+    fn agents(&self) -> AgentsView {
+        AgentsView::from(&self.orchestrator)
+    }
+
     fn board_changed(&self) {
-        let revision = self.revision.fetch_add(1, Ordering::Relaxed) + 1;
-        // No subscriber simply means no browser tab is open.
-        let _ = self.events.send(revision);
+        self.changes.publish();
     }
 }
 
@@ -102,6 +124,7 @@ pub fn router(state: AppState) -> Router {
             "/cards/{id}/delete",
             get(confirm_delete_card).post(delete_card),
         )
+        .route("/runs/{id}/cancel", post(cancel_run))
         .route("/events", get(events))
         .route("/assets/{*path}", get(assets::serve))
         .route("/healthz", get(|| async { "ok" }))
@@ -244,6 +267,7 @@ fn written(headers: &HeaderMap) -> Response {
 #[template(path = "board.html")]
 struct BoardPage {
     board: Board,
+    agents: AgentsView,
 }
 
 #[derive(Template)]
@@ -285,7 +309,8 @@ struct ThreadFragment {
 
 async fn board_page(State(state): State<AppState>) -> AppResult<Html<String>> {
     let board = state.db.call(|conn| store::load_board(conn)).await?;
-    Ok(Html(BoardPage { board }.render()?))
+    let agents = state.agents();
+    Ok(Html(BoardPage { board, agents }.render()?))
 }
 
 async fn board_fragment(State(state): State<AppState>) -> AppResult<Html<String>> {
@@ -322,7 +347,7 @@ async fn edit_card(
             ))
         })
         .await?;
-    let agents = state.agents.clone();
+    let agents = state.agents();
     let html = if is_fetch(&headers) {
         CardPanelFragment {
             board,
@@ -419,12 +444,14 @@ async fn create_card(
     Form(form): Form<CardForm>,
 ) -> AppResult<Response> {
     let (column_id, input) = form.into_parts();
-    let agents = state.agents.clone();
+    let agents = state.agents();
+    let orchestrator = state.orchestrator.clone();
     state
         .db
         .call(move |conn| {
             check_assignment(&agents, None, &input.agent)?;
-            store::create_card(conn, column_id, &input)
+            let id = store::create_card(conn, column_id, &input)?;
+            orchestrator.after_placement(conn, id, true)
         })
         .await?;
     state.board_changed();
@@ -438,13 +465,15 @@ async fn update_card(
     Form(form): Form<CardForm>,
 ) -> AppResult<Response> {
     let (column_id, input) = form.into_parts();
-    let agents = state.agents.clone();
+    let agents = state.agents();
+    let orchestrator = state.orchestrator.clone();
     state
         .db
         .call(move |conn| {
             let current = store::get_card(conn, id)?.agent;
             check_assignment(&agents, current, &input.agent)?;
-            store::update_card(conn, id, column_id, &input)
+            let entered = store::update_card(conn, id, column_id, &input)?;
+            orchestrator.after_placement(conn, id, entered)
         })
         .await?;
     state.board_changed();
@@ -457,9 +486,13 @@ async fn move_card(
     headers: HeaderMap,
     Form(form): Form<MoveForm>,
 ) -> AppResult<Response> {
+    let orchestrator = state.orchestrator.clone();
     state
         .db
-        .call(move |conn| store::move_card(conn, id, form.column_id, form.position))
+        .call(move |conn| {
+            let entered = store::move_card(conn, id, form.column_id, form.position)?;
+            orchestrator.after_placement(conn, id, entered)
+        })
         .await?;
     state.board_changed();
     Ok(written(&headers))
@@ -476,6 +509,20 @@ async fn delete_card(
         .await?;
     state.board_changed();
     Ok(written(&headers))
+}
+
+async fn cancel_run(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+) -> AppResult<Response> {
+    let card_id = state.orchestrator.cancel(&state.db, RunId(id)).await?;
+    state.board_changed();
+    if is_fetch(&headers) {
+        Ok(StatusCode::NO_CONTENT.into_response())
+    } else {
+        Ok(Redirect::to(&format!("/cards/{card_id}/edit")).into_response())
+    }
 }
 
 #[derive(Deserialize)]
@@ -509,7 +556,7 @@ async fn add_comment(
 async fn events(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let receiver = state.events.subscribe();
+    let receiver = state.changes.subscribe();
     let stream = stream::unfold(receiver, |mut receiver| async move {
         let data = match receiver.recv().await {
             Ok(revision) => revision.to_string(),
@@ -524,16 +571,28 @@ async fn events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::PermissionMode;
+    use crate::supervisor::RunDefaults;
     use axum::body::Body;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    fn app_with(gate: RunGate) -> Router {
-        let agents = AgentsView {
+    fn orchestrator(gate: RunGate) -> Orchestrator {
+        Orchestrator::new(
             gate,
-            default_model: ModelName::parse_optional("sonnet").unwrap(),
-        };
-        router(AppState::new(Db::open_in_memory().unwrap(), true, agents))
+            RunDefaults {
+                permission_mode: PermissionMode::DEFAULT,
+                model: ModelName::parse_optional("sonnet").unwrap(),
+            },
+        )
+    }
+
+    fn app_with(gate: RunGate) -> Router {
+        router(AppState::new(
+            Db::open_in_memory().unwrap(),
+            true,
+            orchestrator(gate),
+        ))
     }
 
     fn app() -> Router {
@@ -877,15 +936,7 @@ mod tests {
         post_form(&with_repo, "/cards", "column_id=1&title=Task&agent=claude").await;
 
         // Same database, repository removed from the configuration.
-        let state = AppState::new(
-            Db::open_in_memory().unwrap(),
-            true,
-            AgentsView {
-                gate: RunGate::NoRepo,
-                default_model: None,
-            },
-        );
-        let bare = router(state);
+        let bare = app_with(RunGate::NoRepo);
         assert_eq!(
             post_form(&bare, "/cards", "column_id=1&title=New&agent=claude").await,
             StatusCode::UNPROCESSABLE_ENTITY
@@ -905,14 +956,7 @@ mod tests {
     #[tokio::test]
     async fn a_card_keeps_its_agent_when_edited_while_agents_are_unavailable() {
         let db = Db::open_in_memory().unwrap();
-        let open = router(AppState::new(
-            db.clone(),
-            true,
-            AgentsView {
-                gate: RunGate::Open,
-                default_model: None,
-            },
-        ));
+        let open = router(AppState::new(db.clone(), true, orchestrator(RunGate::Open)));
         post_form(
             &open,
             "/cards",
@@ -920,14 +964,7 @@ mod tests {
         )
         .await;
 
-        let bare = router(AppState::new(
-            db,
-            true,
-            AgentsView {
-                gate: RunGate::NoRepo,
-                default_model: None,
-            },
-        ));
+        let bare = router(AppState::new(db, true, orchestrator(RunGate::NoRepo)));
         let (_, _, page) = send(&bare, get("/cards/1/edit")).await;
         assert!(
             page.contains("type=\"hidden\" name=\"agent\" value=\"claude\""),
@@ -940,6 +977,111 @@ mod tests {
         );
         let (_, _, board) = send(&open, get("/board")).await;
         assert!(board.contains("Renamed") && board.contains("data-agent=\"claude\""));
+    }
+
+    fn wired_app() -> (Router, Db) {
+        let db = Db::open_in_memory().unwrap();
+        let app = router(AppState::new(db.clone(), true, orchestrator(RunGate::Open)));
+        (app, db)
+    }
+
+    async fn run_statuses(db: &Db) -> Vec<(i64, String)> {
+        db.call(|conn| {
+            let rows = conn
+                .prepare("SELECT card_id, status FROM agent_runs ORDER BY id")?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok::<_, StoreError>(rows)
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn dragging_an_assigned_card_into_todo_queues_a_run_and_dragging_it_out_withdraws_it() {
+        let (app, db) = wired_app();
+        post_form(
+            &app,
+            "/cards",
+            "column_id=1&title=Task&agent=claude&model=haiku",
+        )
+        .await;
+        assert!(run_statuses(&db).await.is_empty(), "backlog queues nothing");
+
+        post_form(&app, "/cards/1/move", "column_id=2&position=0").await;
+        assert_eq!(run_statuses(&db).await, [(1, "queued".to_owned())]);
+
+        post_form(&app, "/cards/1/move", "column_id=1&position=0").await;
+        assert_eq!(run_statuses(&db).await, [(1, "cancelled".to_owned())]);
+
+        // The form's column list does the same without script.
+        let request = post("/cards/1")
+            .body(Body::from("column_id=2&title=Task&agent=claude"))
+            .unwrap();
+        assert_eq!(send(&app, request).await.0, StatusCode::SEE_OTHER);
+        assert_eq!(run_statuses(&db).await.len(), 2);
+        assert_eq!(run_statuses(&db).await[1].1, "queued");
+    }
+
+    #[tokio::test]
+    async fn a_closed_gate_queues_no_run_even_for_an_assigned_card() {
+        let db = Db::open_in_memory().unwrap();
+        let app = router(AppState::new(
+            db.clone(),
+            true,
+            orchestrator(RunGate::NotLoopback),
+        ));
+        post_form(&app, "/cards", "column_id=2&title=Task&agent=claude").await;
+        assert!(run_statuses(&db).await.is_empty());
+        let (_, _, page) = send(&app, get("/cards/1/edit")).await;
+        assert!(
+            page.contains("class=\"notice\"") && page.contains("loopback"),
+            "{page}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_can_be_cancelled_from_a_form_once_and_only_while_it_is_active() {
+        let (app, db) = wired_app();
+        post_form(&app, "/cards", "column_id=2&title=Task&agent=claude").await;
+        assert_eq!(run_statuses(&db).await, [(1, "queued".to_owned())]);
+
+        let forged = post("/runs/1/cancel")
+            .header(header::ORIGIN, "http://evil.example")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(send(&app, forged).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(run_statuses(&db).await[0].1, "queued");
+
+        let request = post("/runs/1/cancel").body(Body::empty()).unwrap();
+        let (status, headers, _) = send(&app, request).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(headers[header::LOCATION], "/cards/1/edit");
+        assert_eq!(run_statuses(&db).await[0].1, "cancelled");
+
+        assert_eq!(
+            post_form(&app, "/runs/1/cancel", "").await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            post_form(&app, "/runs/99/cancel", "").await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn a_card_with_an_active_run_cannot_be_deleted_from_the_board() {
+        let (app, _) = wired_app();
+        post_form(&app, "/cards", "column_id=2&title=Task&agent=claude").await;
+        assert_eq!(
+            post_form(&app, "/cards/1/delete", "").await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        post_form(&app, "/runs/1/cancel", "").await;
+        assert_eq!(
+            post_form(&app, "/cards/1/delete", "").await,
+            StatusCode::NO_CONTENT
+        );
     }
 
     const COMMENT: &str =

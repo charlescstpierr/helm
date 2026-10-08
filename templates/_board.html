@@ -1,6 +1,6 @@
 <div class="board" id="board">
   {% for column in board.columns %}
-  <section class="column" data-column-id="{{ column.id }}" data-category="{{ column.category }}" aria-labelledby="column-{{ column.id }}-title">
+  <section class="column" data-column-id="{{ column.id }}" data-category="{{ column.category.slug() }}" aria-labelledby="column-{{ column.id }}-title">
     <header class="column__header">
       <h2 class="column__title" id="column-{{ column.id }}-title">{{ column.name }}</h2>
       <span class="column__count"><span class="visually-hidden">Nombre de cartes : </span><span data-count>{{ column.cards.len() }}</span></span>

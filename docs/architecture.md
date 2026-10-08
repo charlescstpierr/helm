@@ -39,6 +39,13 @@ navigateur ──HTTP──▶ axum (routes.rs) ──▶ store.rs ──▶ SQL
 | `store.rs`      | Modèle du tableau, opérations sur les cartes et les commentaires (synchrone, testé seul). |
 | `mentions.rs`   | Reconnaissance des `@mentions` : cibles connues et scanner pur.             |
 | `routes.rs`     | Pages, formulaires, flux SSE, garde-fous de requête.                        |
+| `runs.rs`       | Exécutions d'agent : machine à états, journal d'événements, opérations de stockage. |
+| `agent.rs`      | Vocabulaire commun : agent, modèle, mode de permission.                     |
+| `adapter.rs`    | `AgentAdapter` : ligne de commande d'un CLI et lecture de son flux (`ClaudeAdapter`). |
+| `supervisor.rs` | `Orchestrator` (mise en file, annulation) et `Supervisor` (processus, worktree, push). |
+| `git.rs`        | Worktrees, comptage de commits et push, par appel au binaire `git`.         |
+| `prompt.rs`     | Consigne envoyée à l'agent, construite depuis la carte et son fil.          |
+| `changes.rs`    | Notification « le tableau a changé », partagée par les routes et le superviseur. |
 | `assets.rs`     | Fichiers statiques embarqués (`rust-embed`), revalidés par ETag.            |
 | `templates/`    | Gabarits Askama compilés dans le binaire.                                   |
 | `assets/`       | `tokens.css` (variables), `app.css` (composants), `app.js`, `theme.js`.     |
@@ -99,8 +106,15 @@ empêchent une page web ouverte dans le même navigateur de le piloter :
   DNS-rebinding).
 
 Écouter ailleurs que sur loopback est possible mais affiche un avertissement : il faut alors
-un proxy ou un VPN de confiance devant. Ce point devient critique dès que le tableau lancera
-des agents (voir les décisions ouvertes).
+un proxy ou un VPN de confiance devant.
+
+Lancer un agent, c'est exécuter du code avec les droits de l'utilisateur (le mode de permission
+par défaut est `bypassPermissions`). **Helm refuse donc de lancer la moindre exécution tant qu'il
+n'écoute pas sur loopback** (`RunGate::NotLoopback`) : l'avertissement au démarrage, un bandeau
+sur le tableau et une note dans le formulaire de carte le disent, et aucune exécution n'est mise
+en file. Sans dépôt configuré (`RunGate::NoRepo`), l'assignation d'un agent est refusée. Les
+routes d'écriture de l'orchestrateur (`POST /runs/{id}/cancel`) passent par le même garde
+`Origin` / `Sec-Fetch-Site` que les autres.
 
 ## 3. Modèle de données
 
@@ -209,48 +223,65 @@ transition n'est interdite — c'est l'outil d'une seule personne. Le dialogue d
 aussi le fil de commentaires de la carte et un formulaire pour en ajouter (auteur `moi`). La suppression est définitive
 (confirmation dans le dialogue, ou page de confirmation sans JavaScript).
 
-**Prévu, avec l'orchestrateur.** Les colonnes gardent leur liberté pour l'humain, mais leur
+**Livré, avec l'orchestrateur.** Les colonnes gardent leur liberté pour l'humain, mais leur
 catégorie déclenche et reflète le travail des agents :
 
 | Transition                         | Qui                | Effet                                                     |
 | ---------------------------------- | ------------------ | --------------------------------------------------------- |
-| → `todo` avec un agent assigné     | humain             | L'exécution est mise en file (`queued`).                  |
+| → `todo` avec un agent assigné     | humain             | L'exécution est mise en file (`queued`). Sortir la carte de `todo` annule l'exécution en file. |
 | `todo` → `in_progress`             | orchestrateur      | Worktree créé, processus lancé (`running`).               |
-| `in_progress` → `in_review`        | orchestrateur      | L'agent a terminé avec succès ; résumé et diff sur la carte. |
-| `in_progress` (reste)              | orchestrateur      | Échec ou interruption : la carte ne bouge pas, l'erreur est commentée, l'humain décide. |
-| `in_review` → `todo`               | humain             | Retours en commentaire ; l'exécution suivante **reprend la session**. |
-| `in_review` → `done`               | humain             | Travail accepté ; le worktree peut être nettoyé.          |
+| `in_progress` → `in_review`        | orchestrateur      | L'agent a terminé avec succès et la branche est poussée sur `origin`. |
+| `in_progress` (reste)              | orchestrateur      | Échec, annulation ou interruption : la carte ne bouge pas, l'erreur est dans l'activité de la carte et dans son fil (commentaire du système, qui n'enregistre jamais de mention). |
+| `in_review` → `todo`               | humain             | Nouvelle exécution (la reprise de session viendra ensuite). |
+| `in_review` → `done`               | humain             | Travail accepté ; le worktree peut être nettoyé (à la main pour l'instant). |
+
+Seule l'*entrée* dans une colonne `todo` déclenche : enregistrer le formulaire d'une carte déjà
+là, ou la réordonner dans la colonne, ne relance rien.
 
 Un agent ne déplace jamais une carte vers `done` : la revue reste humaine.
 
-## 5. Orchestrateur (prévu, non livré)
+## 5. Orchestrateur (première tranche livrée)
 
 ### Modèle d'exécution
 
-Par défaut, un agent est un **processus sans interface**, enfant de Helm :
+Par défaut, un agent est un **processus sans interface**, enfant de Helm. Livré : Claude,
+dont la consigne passe par l'entrée standard (elle peut contenir tout le fil de commentaires).
+Prévu : la reprise et Codex.
 
 ```
-claude -p "<consigne>" --output-format stream-json      # reprise : --resume <session_id>
-codex exec --json "<consigne>"                          # reprise : codex exec resume <session_id>
+claude -p --output-format stream-json --verbose --permission-mode <mode> [--model <m>]   # livré
+claude -p … --resume <session_id>                       # prévu
+codex exec --json "<consigne>"                          # prévu ; reprise : codex exec resume <session_id>
 ```
 
 - **Un worktree git par carte.** `git worktree add <racine>/<clé>-<numéro> -b helm/<clé>-<numéro>`
-  depuis le dépôt du projet ; le processus y est lancé (`cwd`). Les agents ne se marchent pas
+  depuis la branche par défaut du dépôt (celle de `origin/HEAD` si elle est connue, sinon
+  `main`, `master`, ou la branche extraite) ; le processus y est lancé (`cwd`), dans son propre
+  groupe de processus, tué en entier à l'annulation. Les agents ne se marchent pas
   dessus et le dépôt principal reste intact. Le worktree survit à l'exécution (revue, reprise)
   et n'est supprimé qu'une fois la carte terminée ou archivée.
 - **Événements structurés sur la carte.** La sortie standard est lue ligne à ligne (un objet
   JSON par ligne), normalisée par un adaptateur propre à chaque CLI, puis insérée dans
   `agent_events`. Chaque insertion publie un événement SSE : la carte affiche l'activité en
   direct, et l'historique complet reste consultable après coup. La sortie d'erreur est
-  conservée à part pour le diagnostic.
+  conservée à part pour le diagnostic (`agent_runs.stderr`, 256 Kio au plus). Les nouvelles
+  lignes sont annoncées aux navigateurs au plus quatre fois par seconde par exécution.
 - **Reprise par identifiant de session.** Le `session_id` émis par le CLI est enregistré dès
   qu'il apparaît. Relancer après des retours de revue, un échec ou un redémarrage de Helm
   crée une **nouvelle** exécution (`resumed_from`) qui reprend la même session dans le même
   worktree : le contexte de l'agent est conservé, l'historique des tentatives aussi.
 - **Supervision.** Les processus sont lancés avec `tokio::process` et attendus de façon
   asynchrone ; une limite de concurrence configurable borne le nombre d'agents simultanés.
-  Au démarrage, toute exécution encore `running` en base dont le processus n'existe plus
-  passe à `interrupted` — reprenable, jamais relancée en silence.
+  Au démarrage, toute exécution encore `running` en base passe à `interrupted` — jamais
+  relancée en silence ; si son processus existe encore, l'erreur le dit (Helm ne peut plus le
+  superviser et ne tue pas un pid qu'il ne peut pas identifier). Une seule exécution active par
+  carte (index unique partiel).
+- **Fin de travail : pousser la branche.** Après un succès de l'agent, Helm vérifie que la
+  branche porte au moins un commit de plus que la branche par défaut (sinon l'exécution
+  échoue : « rien à pousser »), puis exécute `git push --set-upstream origin helm/<clé>-<n>`,
+  jamais forcé. Aucune PR n'est ouverte. Un push refusé ou impossible fait échouer l'exécution :
+  la base refuse un `succeeded` sans `pushed_at`. Les modifications non commitées laissées par
+  l'agent restent dans le worktree et sont signalées dans le journal.
 
 Un trait `AgentAdapter` isole ce qui diffère entre CLI : construire la commande (lancement et
 reprise), reconnaître l'identifiant de session, traduire chaque ligne en événement normalisé,
@@ -304,16 +335,19 @@ conversation, et remplacer un agent par un autre ne change pas le protocole.
 1. **Interface des agents avec le tableau** — sous-commandes du binaire (`helm comment`,
    `helm card create`…), API HTTP JSON locale, ou serveur MCP ? Le CLI est le plus simple à
    donner à `claude -p` et `codex exec` ; MCP est plus riche mais ajoute une surface.
-2. **Permissions des agents** — quels outils et quel niveau d'autonomie par défaut
-   (`--permission-mode`, bac à sable de Codex) ? Réglage global, par projet ou par carte ?
-3. **Authentification** — nécessaire dès que Helm lance des processus : une requête acceptée
-   devient de l'exécution de code. Jeton local, ou rester strictement sur loopback ?
-4. **Projets et dépôts** — un projet = un dépôt git ? Où vivent les worktrees
-   (`~/.local/share/helm/worktrees`, à côté du dépôt) et qui les nettoie ?
-5. **Assignation** — un agent par carte, ou plusieurs rôles (auteur, relecteur) ? Qui choisit
-   l'agent : l'humain, une étiquette, une règle de projet ?
-6. **Fin de travail** — l'agent ouvre-t-il une PR, pousse-t-il une branche, ou s'arrête-t-il
-   au commit local dans le worktree ?
+2. **Permissions des agents** — décidé pour la première tranche : autonomie complète
+   (`bypassPermissions`), réglable globalement dans `helm.toml`
+   (`agents.claude.permission_mode`). Reste ouvert : un réglage par projet ou par carte, et le
+   bac à sable de Codex.
+3. **Authentification** — contournée, pas résolue : Helm refuse de lancer des exécutions hors
+   loopback. Un jeton local reste nécessaire pour écouter ailleurs.
+4. **Projets et dépôts** — un projet = un dépôt (`project.repo`), worktrees sous
+   `project.worktree_root`. Reste ouvert : qui nettoie les worktrees (aucun nettoyage
+   automatique pour l'instant).
+5. **Assignation** — un agent par carte, choisi par l'humain (champ du formulaire). Reste
+   ouvert : plusieurs rôles (auteur, relecteur) et les règles de projet.
+6. **Fin de travail** — décidé : l'agent s'arrête au commit, Helm pousse la branche et n'ouvre
+   pas de PR.
 7. **Rétention des événements** — les flux `stream-json` sont volumineux : tout garder,
    compacter après N jours, ou ne conserver que les événements significatifs ?
 8. **Budget** — plafond de coût ou de durée par exécution, et comportement à l'atteinte.

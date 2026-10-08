@@ -515,6 +515,12 @@ kbd {
   font-size: var(--font-size-sm);
 }
 
+.notice--danger {
+  border-color: var(--color-danger);
+  background: var(--color-danger-surface);
+  color: var(--color-danger);
+}
+
 .field-row {
   display: flex;
   flex-wrap: wrap;

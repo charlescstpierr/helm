@@ -147,11 +147,58 @@ impl Card {
     }
 }
 
+/// The stable status of a column, the one thing the orchestrator reasons about. A column's
+/// name is only a label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Category {
+    Backlog,
+    Todo,
+    InProgress,
+    InReview,
+    Done,
+}
+
+impl Category {
+    pub const ALL: [Self; 5] = [
+        Self::Backlog,
+        Self::Todo,
+        Self::InProgress,
+        Self::InReview,
+        Self::Done,
+    ];
+
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Backlog => "backlog",
+            Self::Todo => "todo",
+            Self::InProgress => "in_progress",
+            Self::InReview => "in_review",
+            Self::Done => "done",
+        }
+    }
+}
+
+impl ToSql for Category {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        self.slug().to_sql()
+    }
+}
+
+impl FromSql for Category {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let text = value.as_str()?;
+        Self::ALL
+            .into_iter()
+            .find(|category| category.slug() == text)
+            .ok_or_else(|| FromSqlError::Other(format!("unknown category {text:?}").into()))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Column {
     pub id: i64,
     pub name: String,
-    pub category: String,
+    pub category: Category,
     pub cards: Vec<Card>,
 }
 
@@ -422,12 +469,13 @@ pub fn create_card(conn: &mut Connection, column_id: i64, input: &CardInput) -> 
 }
 
 /// Updates a card's fields; changing `column_id` sends it to the bottom of the new column.
+/// Returns whether the card entered a different column.
 pub fn update_card(
     conn: &mut Connection,
     id: i64,
     column_id: i64,
     input: &CardInput,
-) -> Result<()> {
+) -> Result<bool> {
     let card = input.validate()?;
     let tx = conn.transaction()?;
     let (project_id, current_column) = card_location(&tx, id)?;
@@ -445,20 +493,69 @@ pub fn update_card(
         ),
     )?;
     set_labels(&tx, project_id, id, &card.labels)?;
-    if column_id != current_column {
+    let entered = column_id != current_column;
+    if entered {
         place_card(&tx, id, project_id, current_column, column_id, usize::MAX)?;
     }
     tx.commit()?;
-    Ok(())
+    Ok(entered)
 }
 
 /// Moves a card to `index` (0-based, clamped) in `column_id`, keeping positions dense.
-pub fn move_card(conn: &mut Connection, id: i64, column_id: i64, index: usize) -> Result<()> {
+/// Returns whether the card entered a different column.
+pub fn move_card(conn: &mut Connection, id: i64, column_id: i64, index: usize) -> Result<bool> {
     let tx = conn.transaction()?;
     let (project_id, current_column) = card_location(&tx, id)?;
     place_card(&tx, id, project_id, current_column, column_id, index)?;
     tx.commit()?;
-    Ok(())
+    Ok(column_id != current_column)
+}
+
+/// The category of the column a card is in.
+pub fn card_category(conn: &Connection, id: i64) -> Result<Category> {
+    conn.query_row(
+        "SELECT bc.category FROM cards c JOIN board_columns bc ON bc.id = c.column_id
+         WHERE c.id = ?1",
+        [id],
+        |row| row.get(0),
+    )
+    .optional()?
+    .ok_or(StoreError::NotFound)
+}
+
+/// Moves a card to the bottom of its project's first column of `category`. Returns `false`
+/// when the project has no such column (columns are not customisable yet, but may be).
+pub fn move_to_category(conn: &mut Connection, id: i64, category: Category) -> Result<bool> {
+    let tx = conn.transaction()?;
+    let (project_id, current_column) = card_location(&tx, id)?;
+    let target: Option<i64> = tx
+        .query_row(
+            "SELECT id FROM board_columns WHERE project_id = ?1 AND category = ?2
+             ORDER BY position LIMIT 1",
+            (project_id, category),
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(column_id) = target else {
+        return Ok(false);
+    };
+    if column_id != current_column {
+        place_card(&tx, id, project_id, current_column, column_id, usize::MAX)?;
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
+/// `(project key, card number)`: the card's human identifier, `HELM-12`.
+pub fn card_key(conn: &Connection, id: i64) -> Result<(String, i64)> {
+    conn.query_row(
+        "SELECT p.key, c.number FROM cards c JOIN projects p ON p.id = c.project_id
+         WHERE c.id = ?1",
+        [id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()?
+    .ok_or(StoreError::NotFound)
 }
 
 pub fn delete_card(conn: &mut Connection, id: i64) -> Result<()> {
@@ -616,6 +713,13 @@ pub struct Author {
 }
 
 impl Author {
+    pub fn helm() -> Self {
+        Self {
+            kind: AuthorKind::System,
+            name: "helm".to_owned(),
+        }
+    }
+
     pub fn moi() -> Self {
         Self {
             kind: AuthorKind::Human,
@@ -695,6 +799,9 @@ pub fn list_comments(conn: &Connection, card_id: i64) -> Result<Vec<Comment>> {
         .collect::<rusqlite::Result<_>>()?)
 }
 
+/// Stores a comment. Only human and agent comments record `@mentions`: a system comment
+/// quotes text Helm does not control (an error message, a branch name) and must never queue
+/// work for an agent.
 pub fn add_comment(
     conn: &mut Connection,
     card_id: i64,
@@ -718,7 +825,11 @@ pub fn add_comment(
         (card_id, author.kind, &author.name, body),
     )?;
     let comment_id = tx.last_insert_rowid();
-    for target in mentions::mentioned_targets(body) {
+    let targets = match author.kind {
+        AuthorKind::System => Vec::new(),
+        AuthorKind::Human | AuthorKind::Agent => mentions::mentioned_targets(body),
+    };
+    for target in targets {
         tx.execute(
             "INSERT INTO mentions (comment_id, target) VALUES (?1, ?2)",
             (comment_id, target.slug()),
@@ -863,6 +974,61 @@ mod tests {
             ));
         }
         assert!(layout_agents(&conn).is_empty());
+    }
+
+    #[test]
+    fn categories_move_cards_to_the_matching_column_and_report_a_missing_one() {
+        let mut conn = test_conn();
+        let id = create_card(&mut conn, 1, &input("A")).unwrap();
+        assert_eq!(card_category(&conn, id).unwrap(), Category::Backlog);
+
+        assert!(move_to_category(&mut conn, id, Category::InReview).unwrap());
+        assert_eq!(card_category(&conn, id).unwrap(), Category::InReview);
+        assert_eq!(layout(&conn)[3], ["A"]);
+        assert_dense_positions(&conn);
+
+        conn.execute("DELETE FROM board_columns WHERE category = 'done'", [])
+            .unwrap();
+        assert!(!move_to_category(&mut conn, id, Category::Done).unwrap());
+        assert_eq!(card_category(&conn, id).unwrap(), Category::InReview);
+        assert!(matches!(
+            card_category(&conn, 99),
+            Err(StoreError::NotFound)
+        ));
+        assert_eq!(card_key(&conn, id).unwrap(), ("HELM".to_owned(), 1));
+    }
+
+    #[test]
+    fn update_and_move_report_whether_the_card_changed_column() {
+        let mut conn = test_conn();
+        let id = create_card(&mut conn, 1, &input("A")).unwrap();
+        assert!(!move_card(&mut conn, id, 1, 0).unwrap());
+        assert!(move_card(&mut conn, id, 2, 0).unwrap());
+        assert!(!update_card(&mut conn, id, 2, &input("B")).unwrap());
+        assert!(update_card(&mut conn, id, 3, &input("B")).unwrap());
+    }
+
+    #[test]
+    fn system_comments_never_record_mentions_but_human_ones_do() {
+        let mut conn = test_conn();
+        let id = create_card(&mut conn, 1, &input("A")).unwrap();
+        add_comment(
+            &mut conn,
+            id,
+            &Author::helm(),
+            "git said: ask @claude and @codex",
+        )
+        .unwrap();
+        let mentions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mentions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mentions, 0);
+        add_comment(&mut conn, id, &Author::moi(), "@claude please").unwrap();
+        let mentions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mentions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mentions, 1);
+        assert_eq!(list_comments(&conn, id).unwrap()[0].author, Author::helm());
     }
 
     #[test]

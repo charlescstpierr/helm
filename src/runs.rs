@@ -399,6 +399,96 @@ fn change_status(
     Ok(())
 }
 
+/// Where the run works, once its worktree exists.
+pub fn record_workspace(conn: &Connection, id: RunId, path: &str, branch: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE agent_runs SET worktree_path = ?2, branch = ?3 WHERE id = ?1",
+        (id, path, branch),
+    )?;
+    Ok(())
+}
+
+pub fn record_pid(conn: &Connection, id: RunId, pid: u32) -> Result<()> {
+    conn.execute(
+        "UPDATE agent_runs SET pid = ?2 WHERE id = ?1",
+        (id, i64::from(pid)),
+    )?;
+    Ok(())
+}
+
+/// Keeps the first session id: it is the one a resume would name.
+pub fn record_session(conn: &Connection, id: RunId, session_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE agent_runs SET session_id = COALESCE(session_id, ?2) WHERE id = ?1",
+        (id, session_id),
+    )?;
+    Ok(())
+}
+
+pub fn record_usage(
+    conn: &Connection,
+    id: RunId,
+    cost_usd: Option<f64>,
+    tokens_in: Option<i64>,
+    tokens_out: Option<i64>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE agent_runs SET cost_usd = ?2, tokens_in = ?3, tokens_out = ?4 WHERE id = ?1",
+        (id, cost_usd, tokens_in, tokens_out),
+    )?;
+    Ok(())
+}
+
+pub fn record_exit(
+    conn: &Connection,
+    id: RunId,
+    exit_code: Option<i32>,
+    stderr: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE agent_runs SET exit_code = ?2, stderr = ?3 WHERE id = ?1",
+        (id, exit_code, stderr),
+    )?;
+    Ok(())
+}
+
+/// Cancels the card's queued run, if any. A running one is the supervisor's to stop.
+pub fn cancel_queued(conn: &mut Connection, card_id: i64) -> Result<bool> {
+    let queued: Option<RunId> = conn
+        .query_row(
+            "SELECT id FROM agent_runs WHERE card_id = ?1 AND status = 'queued'",
+            [card_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(id) = queued else {
+        return Ok(false);
+    };
+    finish(conn, id, &Outcome::Cancelled)?;
+    Ok(true)
+}
+
+/// A run that was `running` when Helm stopped, with the pid it was last known by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Orphan {
+    pub id: RunId,
+    pub card_id: i64,
+    pub pid: Option<i64>,
+}
+
+pub fn running_runs(conn: &Connection) -> Result<Vec<Orphan>> {
+    Ok(conn
+        .prepare("SELECT id, card_id, pid FROM agent_runs WHERE status = 'running' ORDER BY id")?
+        .query_map([], |row| {
+            Ok(Orphan {
+                id: row.get(0)?,
+                card_id: row.get(1)?,
+                pid: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
 /// Appends to a run's log and returns the event's `seq`.
 pub fn append_event(conn: &Connection, run: RunId, event: &NewEvent) -> Result<i64> {
     Ok(conn.query_row(
@@ -632,6 +722,46 @@ mod tests {
             get_run(&conn, RunId(999)),
             Err(StoreError::NotFound)
         ));
+    }
+
+    #[test]
+    fn progress_is_recorded_on_the_run_and_the_first_session_id_wins() {
+        let (mut conn, card) = conn_with_card();
+        let id = queue(&mut conn, card, "p").unwrap();
+        claim_next_queued(&mut conn).unwrap();
+
+        record_workspace(&conn, id, "/wt/HELM-1", "helm/HELM-1").unwrap();
+        record_pid(&conn, id, 4242).unwrap();
+        record_session(&conn, id, "first").unwrap();
+        record_session(&conn, id, "second").unwrap();
+        record_usage(&conn, id, Some(0.25), Some(10), Some(20)).unwrap();
+        record_exit(&conn, id, Some(0), "warn\n").unwrap();
+
+        let run = get_run(&conn, id).unwrap();
+        assert_eq!(run.worktree_path.as_deref(), Some("/wt/HELM-1"));
+        assert_eq!(run.branch.as_deref(), Some("helm/HELM-1"));
+        assert_eq!(run.pid, Some(4242));
+        assert_eq!(run.session_id.as_deref(), Some("first"));
+        assert_eq!(
+            (run.cost_usd, run.tokens_in, run.tokens_out),
+            (Some(0.25), Some(10), Some(20))
+        );
+        assert_eq!((run.exit_code, run.stderr.as_str()), (Some(0), "warn\n"));
+    }
+
+    #[test]
+    fn only_a_queued_run_is_cancelled_by_cancel_queued() {
+        let (mut conn, card) = conn_with_card();
+        assert!(!cancel_queued(&mut conn, card).unwrap());
+        let id = queue(&mut conn, card, "p").unwrap();
+        assert!(cancel_queued(&mut conn, card).unwrap());
+        assert_eq!(get_run(&conn, id).unwrap().status, RunStatus::Cancelled);
+
+        let id = queue(&mut conn, card, "q").unwrap();
+        claim_next_queued(&mut conn).unwrap();
+        assert!(!cancel_queued(&mut conn, card).unwrap());
+        assert_eq!(get_run(&conn, id).unwrap().status, RunStatus::Running);
+        assert_eq!(running_runs(&conn).unwrap().len(), 1);
     }
 
     #[test]

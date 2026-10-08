@@ -1,8 +1,9 @@
 # helm
 
 Kanban auto-hébergé en Rust pour développeur solo, destiné à orchestrer des agents de code
-(`claude -p`, `codex exec`). Cette version livre le tableau et les commentaires ;
-l'orchestration est conçue dans [docs/architecture.md](docs/architecture.md) et viendra ensuite.
+(`claude -p`, `codex exec`). Cette version livre le tableau, les commentaires et une première
+tranche de l'orchestration (Claude, une branche poussée par carte) ; la suite est conçue dans
+[docs/architecture.md](docs/architecture.md).
 
 ## Lancer
 
@@ -47,6 +48,23 @@ Modèle : [helm.example.toml](helm.example.toml).
 Helm n'a pas d'authentification : gardez l'écoute sur loopback, ou placez un proxy ou un VPN de
 confiance devant.
 
+## Lancer des agents
+
+Renseignez `project.repo` dans `helm.toml` (un dépôt git avec un remote `origin`) et gardez
+`bind` sur loopback : sans dépôt, l'assignation d'un agent est indisponible ; hors loopback, Helm
+refuse de lancer quoi que ce soit, parce qu'une exécution est de l'exécution de code avec vos
+droits et que rien n'authentifie les requêtes.
+
+Dans le formulaire d'une carte, choisissez l'agent (Claude) et, si besoin, un modèle (vide : celui
+de `agents.claude.model`, sinon celui du CLI). Quand la carte **entre** dans une colonne « À
+faire », une exécution est mise en file : Helm crée le worktree `<racine>/<CLÉ>-<n>` sur la
+branche `helm/<CLÉ>-<n>`, lance `claude -p` dedans (mode `bypassPermissions` par défaut), garde
+chaque événement du flux sur la carte, puis pousse la branche vers `origin`. Succès : la carte
+passe en « En revue ». Échec (agent, absence de commit, push refusé) : elle reste « En cours » et
+l'erreur est ajoutée au fil de la carte. Aucune PR n'est ouverte et les worktrees ne sont pas nettoyés.
+Une exécution en cours peut être annulée depuis la carte ; si Helm s'arrête pendant une
+exécution, celle-ci est marquée « interrompue » au redémarrage et n'est jamais relancée seule.
+
 ## Architecture
 
 Un seul crate binaire : Axum sur un runtime Tokio mono-thread sert des pages rendues côté
@@ -63,10 +81,14 @@ données, cycle de vie des cartes et conception de l'orchestrateur :
 ## Développer
 
 ```sh
-cargo test                                   # cartes, commentaires et mentions, migrations, routes
+cargo test                                   # cartes, commentaires, migrations, routes, orchestrateur
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
+
+Les tests de l'orchestrateur n'appellent ni `claude` ni le réseau : ils lancent
+`tests/fixtures/fake-claude.sh`, qui rejoue des flux enregistrés (le scénario est la ligne
+`SCENARIO: …` de la consigne), avec un vrai `git` et un dépôt `origin` nu temporaire.
 
 En build de développement (`cargo run`), `assets/` est relu depuis le disque à chaque requête :
 le CSS et le JavaScript se modifient sans recompiler. Les gabarits de `templates/`, eux, sont

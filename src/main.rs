@@ -1,24 +1,29 @@
 //! Helm: a self-hosted kanban that will orchestrate coding agents. See `docs/architecture.md`.
 
-// Consumed by the supervisor, which arrives later in the same stack.
-#[allow(dead_code)]
 mod adapter;
 mod agent;
 mod assets;
+mod changes;
 mod config;
 mod db;
+mod git;
 mod mentions;
+mod prompt;
 mod routes;
-// Consumed by the supervisor, which arrives later in the same stack.
+// The card page that reads a run's events arrives later in the same stack.
 #[allow(dead_code)]
 mod runs;
 mod store;
+mod supervisor;
 
 use std::error::Error;
 use std::process::ExitCode;
+use std::sync::Arc;
 
-use config::Config;
+use adapter::ClaudeAdapter;
+use config::{Config, RunGate};
 use db::Db;
+use supervisor::{Orchestrator, RunDefaults, Supervisor, SupervisorConfig};
 
 const USAGE: &str = "\
 Usage: helm [--help | --version]
@@ -70,11 +75,28 @@ fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
 }
 
 async fn serve(config: &Config, db: Db) -> Result<(), Box<dyn Error>> {
-    let agents = routes::AgentsView {
-        gate: config.run_gate(),
-        default_model: config.agents.claude.model.clone(),
-    };
-    let state = routes::AppState::new(db, config.bind.ip().is_loopback(), agents);
+    let gate = config.run_gate();
+    let claude = &config.agents.claude;
+    let orchestrator = Orchestrator::new(
+        gate,
+        RunDefaults {
+            permission_mode: claude.permission_mode,
+            model: claude.model.clone(),
+        },
+    );
+    let state = routes::AppState::new(
+        db.clone(),
+        config.bind.ip().is_loopback(),
+        orchestrator.clone(),
+    );
+    let changes = state.changes();
+
+    // A previous Helm may have died mid-run, whatever the gate says today.
+    let interrupted = supervisor::recover(&db, &changes).await?;
+    if interrupted > 0 {
+        eprintln!("helm: {interrupted} run(s) left running by a previous Helm marked interrupted");
+    }
+
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .map_err(|e| format!("cannot listen on {}: {e}", config.bind))?;
@@ -86,10 +108,37 @@ async fn serve(config: &Config, db: Db) -> Result<(), Box<dyn Error>> {
     if !config.bind.ip().is_loopback() {
         eprintln!("helm: warning: not bound to loopback and there is no authentication");
     }
-    match config.run_gate().notice() {
-        Some(notice) => eprintln!("helm: agents disabled: {notice}"),
-        None => eprintln!("helm: agents enabled"),
-    }
+    let _supervisor = match (gate, &config.project) {
+        (RunGate::Open, Some(project)) => {
+            git::check_repository(&project.repo).await?;
+            eprintln!(
+                "helm: agents enabled (repo {}, worktrees in {}, at most {} at once)",
+                project.repo.display(),
+                project.worktree_root.display(),
+                config.agents.max_concurrent
+            );
+            let supervisor = Supervisor::new(
+                db,
+                orchestrator,
+                Arc::new(ClaudeAdapter {
+                    command: claude.command.clone(),
+                }),
+                changes,
+                SupervisorConfig {
+                    repo: project.repo.clone(),
+                    worktree_root: project.worktree_root.clone(),
+                    max_concurrent: config.agents.max_concurrent,
+                },
+            );
+            Some(tokio::spawn(Arc::new(supervisor).run()))
+        }
+        _ => {
+            if let Some(notice) = gate.notice() {
+                eprintln!("helm: agents disabled: {notice}");
+            }
+            None
+        }
+    };
     // Open SSE streams never finish on their own, so stop serving as soon as a signal
     // arrives instead of waiting for connections to drain.
     tokio::select! {
