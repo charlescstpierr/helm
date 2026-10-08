@@ -104,6 +104,8 @@ pub struct Card {
     pub agent: Option<Agent>,
     /// The `--model` for that agent; `None` means the project default.
     pub model: Option<ModelName>,
+    /// Where the card's latest run stands, for the board tile.
+    pub run_status: Option<RunStatus>,
 }
 
 impl Card {
@@ -348,7 +350,8 @@ pub fn load_board(conn: &Connection) -> Result<Board> {
     let cards: Vec<Card> = conn
         .prepare(
             "SELECT id, column_id, number, title, description, priority,
-                    (SELECT COUNT(*) FROM comments WHERE card_id = cards.id), agent, model
+                    (SELECT COUNT(*) FROM comments WHERE card_id = cards.id), agent, model,
+                    (SELECT status FROM agent_runs WHERE card_id = cards.id ORDER BY id DESC LIMIT 1)
              FROM cards
              WHERE project_id = ?1 ORDER BY column_id, position, id",
         )?
@@ -373,7 +376,8 @@ pub fn get_card(conn: &Connection, id: i64) -> Result<Card> {
     let mut card = conn
         .query_row(
             "SELECT id, column_id, number, title, description, priority,
-                    (SELECT COUNT(*) FROM comments WHERE card_id = cards.id), agent, model
+                    (SELECT COUNT(*) FROM comments WHERE card_id = cards.id), agent, model,
+                    (SELECT status FROM agent_runs WHERE card_id = cards.id ORDER BY id DESC LIMIT 1)
              FROM cards
              WHERE id = ?1",
             [id],
@@ -399,6 +403,7 @@ fn card_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Card> {
         comment_count: row.get(6)?,
         agent: row.get(7)?,
         model: row.get(8)?,
+        run_status: row.get(9)?,
     })
 }
 
@@ -736,6 +741,17 @@ pub struct Comment {
     pub created_at: i64,
 }
 
+/// `2026-10-07 14:03 UTC`: the no-script rendering of a timestamp.
+pub fn utc_display(timestamp: i64) -> String {
+    let iso = utc_iso(timestamp);
+    format!("{} {} UTC", &iso[..10], &iso[11..16])
+}
+
+/// `14:03:07 UTC`: for log lines, where the date is the card's.
+pub fn utc_time_display(timestamp: i64) -> String {
+    format!("{} UTC", &utc_iso(timestamp)[11..19])
+}
+
 impl Comment {
     pub fn segments(&self) -> Vec<Segment<'_>> {
         mentions::segments(&self.body)
@@ -746,12 +762,11 @@ impl Comment {
     }
 
     pub fn created_display(&self) -> String {
-        let iso = self.created_iso();
-        format!("{} {} UTC", &iso[..10], &iso[11..16])
+        utc_display(self.created_at)
     }
 }
 
-fn utc_iso(timestamp: i64) -> String {
+pub fn utc_iso(timestamp: i64) -> String {
     let (year, month, day) = civil_from_days(timestamp.div_euclid(86_400));
     let seconds = timestamp.rem_euclid(86_400);
     format!(

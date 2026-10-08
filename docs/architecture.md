@@ -326,6 +326,12 @@ conversation, et remplacer un agent par un autre ne change pas le protocole.
 - **Clavier.** Flèches pour naviguer entre cartes et colonnes, `Alt` + flèches pour déplacer,
   `Entrée` pour ouvrir, `N` pour une nouvelle carte, `Échap` pour fermer. Focus toujours
   visible (`:focus-visible`), lien d'évitement, région `aria-live` annonçant les déplacements.
+- **Activité de l'agent.** Le dialogue de la carte affiche la dernière exécution : statut, branche,
+  session, durée, coût, jetons, journal des 200 derniers événements (le bruit du CLI est
+  enregistré mais masqué), sortie d'erreur et consigne. `GET /cards/{id}/activity` en rend le
+  fragment ; le script le recharge à chaque événement SSE sans toucher au formulaire. Sans
+  JavaScript, la page de la carte porte le même panneau et le bouton d'annulation est un
+  formulaire.
 - **Sans JavaScript**, créer, modifier, déplacer (liste « Colonne »), supprimer et commenter
   restent possibles par envoi de formulaire classique. Les heures des commentaires sont alors
   affichées en UTC ; le script les convertit dans le fuseau du navigateur.

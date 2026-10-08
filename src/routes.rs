@@ -20,7 +20,7 @@ use crate::assets;
 use crate::changes::Changes;
 use crate::config::RunGate;
 use crate::db::Db;
-use crate::runs::RunId;
+use crate::runs::{self, Activity, RunId};
 use crate::store::{self, Author, Board, Card, CardInput, Comment, StoreError};
 use crate::supervisor::Orchestrator;
 
@@ -120,6 +120,7 @@ pub fn router(state: AppState) -> Router {
             "/cards/{id}/comments",
             get(comment_thread).post(add_comment),
         )
+        .route("/cards/{id}/activity", get(card_activity))
         .route(
             "/cards/{id}/delete",
             get(confirm_delete_card).post(delete_card),
@@ -289,6 +290,7 @@ struct CardEditPage {
     board: Board,
     card: Card,
     comments: Vec<Comment>,
+    activity: Activity,
     agents: AgentsView,
 }
 
@@ -298,7 +300,14 @@ struct CardPanelFragment {
     board: Board,
     card: Card,
     comments: Vec<Comment>,
+    activity: Activity,
     agents: AgentsView,
+}
+
+#[derive(Template)]
+#[template(path = "_activity.html")]
+struct ActivityFragment {
+    activity: Activity,
 }
 
 #[derive(Template)]
@@ -337,13 +346,14 @@ async fn edit_card(
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> AppResult<Html<String>> {
-    let (board, card, comments) = state
+    let (board, card, comments, activity) = state
         .db
         .call(move |conn| {
             Ok::<_, StoreError>((
                 store::load_board(conn)?,
                 store::get_card(conn, id)?,
                 store::list_comments(conn, id)?,
+                runs::activity(conn, id)?,
             ))
         })
         .await?;
@@ -353,6 +363,7 @@ async fn edit_card(
             board,
             card,
             comments,
+            activity,
             agents,
         }
         .render()?
@@ -361,11 +372,26 @@ async fn edit_card(
             board,
             card,
             comments,
+            activity,
             agents,
         }
         .render()?
     };
     Ok(Html(html))
+}
+
+async fn card_activity(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> AppResult<Html<String>> {
+    let activity = state
+        .db
+        .call(move |conn| {
+            store::get_card(conn, id)?;
+            runs::activity(conn, id)
+        })
+        .await?;
+    Ok(Html(ActivityFragment { activity }.render()?))
 }
 
 async fn comment_thread(
@@ -1081,6 +1107,121 @@ mod tests {
         assert_eq!(
             post_form(&app, "/cards/1/delete", "").await,
             StatusCode::NO_CONTENT
+        );
+    }
+
+    #[tokio::test]
+    async fn the_card_shows_its_runs_activity_live_without_script_and_as_a_fragment() {
+        let (app, db) = wired_app();
+        post_form(&app, "/cards", "column_id=1&title=Task&agent=claude").await;
+
+        let (_, _, page) = send(&app, get("/cards/1/edit")).await;
+        assert!(
+            page.contains("id=\"run-activity\"") && page.contains("Aucune exécution"),
+            "{page}"
+        );
+
+        post_form(&app, "/cards/1/move", "column_id=2&position=0").await;
+        let run_id = db
+            .call(|conn| {
+                let run = runs::claim_next_queued(conn)?.unwrap();
+                runs::record_workspace(conn, run.id, "/wt/HELM-1", "helm/HELM-1")?;
+                runs::record_session(conn, run.id, "sess-123")?;
+                runs::record_usage(conn, run.id, Some(0.05), Some(12), Some(34))?;
+                for (kind, summary) in [
+                    (runs::EventKind::System, "system:hook_started"),
+                    (runs::EventKind::ToolUse, "Bash: <b>ls</b>"),
+                    (runs::EventKind::Error, "boom"),
+                ] {
+                    runs::append_event(
+                        conn,
+                        run.id,
+                        &runs::NewEvent {
+                            kind,
+                            summary: summary.to_owned(),
+                            payload: "{}".to_owned(),
+                        },
+                    )?;
+                }
+                Ok::<_, StoreError>(run.id)
+            })
+            .await
+            .unwrap();
+
+        let (status, _, panel) = send(&app, get("/cards/1/activity")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(panel.starts_with("<div class=\"activity\" id=\"run-activity\">"));
+        assert!(panel.contains("data-status=\"running\"") && panel.contains("En cours"));
+        assert!(panel.contains("helm/HELM-1") && panel.contains("sess-123"));
+        assert!(panel.contains("0,0500 $") && panel.contains("12 → 34"));
+        assert!(
+            panel.contains("action=\"/runs/1/cancel\""),
+            "a running run can be cancelled"
+        );
+        assert!(
+            panel.contains("Bash: &lt;b&gt;ls&lt;/b&gt;") || panel.contains("Bash: &#60;b&#62;ls"),
+            "escaped: {panel}"
+        );
+        assert!(
+            !panel.contains("hook_started"),
+            "CLI bookkeeping is not shown"
+        );
+        assert!(panel.contains("3 événements enregistrés, 1 non affichés"));
+        assert!(panel.find("Bash:").unwrap() < panel.find("boom").unwrap());
+        assert!(
+            !panel.contains("<form class=\"form\""),
+            "the fragment never carries the card form"
+        );
+
+        // The card dialog and the full page embed the same panel, after the form.
+        let (_, _, page) = send(&app, get("/cards/1/edit")).await;
+        assert!(page.contains("Activité de l'agent") && page.contains("sess-123"));
+        let (_, _, board) = send(&app, get("/board")).await;
+        assert!(
+            board.contains("class=\"run-status\" data-status=\"running\""),
+            "{board}"
+        );
+
+        db.call(move |conn| {
+            runs::finish(
+                conn,
+                run_id,
+                &runs::Outcome::Failed("push refused".to_owned()),
+            )
+        })
+        .await
+        .unwrap();
+        let (_, _, panel) = send(&app, get("/cards/1/activity")).await;
+        assert!(panel.contains("data-status=\"failed\"") && panel.contains("push refused"));
+        assert!(
+            !panel.contains("/runs/1/cancel"),
+            "a finished run has nothing to cancel"
+        );
+
+        assert_eq!(
+            send(&app, get("/cards/42/activity")).await.0,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_run_event_wakes_open_browsers_through_the_shared_notifier() {
+        let db = Db::open_in_memory().unwrap();
+        let state = AppState::new(db, true, orchestrator(RunGate::Open));
+        let changes = state.changes();
+        let app = router(state);
+        let response = app.clone().oneshot(get("/events")).await.unwrap();
+        let mut body = response.into_body();
+        changes.publish();
+        let frame = tokio::time::timeout(Duration::from_secs(5), body.frame())
+            .await
+            .expect("an SSE frame after a supervisor publish")
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap();
+        assert!(
+            text.contains("event: board") && text.contains("data: 1"),
+            "{text}"
         );
     }
 

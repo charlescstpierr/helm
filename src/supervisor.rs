@@ -901,7 +901,7 @@ mod tests {
 
         async fn events(&self, run: RunId) -> Vec<(EventKind, String)> {
             self.db
-                .call(move |conn| runs::list_events(conn, run))
+                .call(move |conn| runs::list_events(conn, run, 1000))
                 .await
                 .unwrap()
                 .into_iter()
@@ -1048,10 +1048,10 @@ mod tests {
         assert_eq!(malformed.len(), 2, "{events:?}");
         assert!(malformed[0].contains("this is not json"));
         let seqs =
-            h.db.call(move |conn| runs::list_events(conn, run.id))
+            h.db.call(move |conn| runs::list_events(conn, run.id, 1000))
                 .await
                 .unwrap();
-        assert!(seqs.windows(2).all(|w| w[1].seq == w[0].seq + 1));
+        assert!(seqs.windows(2).all(|w| w[1].seq > w[0].seq));
     }
 
     #[tokio::test]

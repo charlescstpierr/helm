@@ -10,8 +10,6 @@ mod git;
 mod mentions;
 mod prompt;
 mod routes;
-// The card page that reads a run's events arrives later in the same stack.
-#[allow(dead_code)]
 mod runs;
 mod store;
 mod supervisor;

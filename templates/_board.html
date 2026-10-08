@@ -18,7 +18,7 @@
           <li class="priority" data-priority="{{ card.priority_slug() }}"><span class="visually-hidden">Priorité : </span>{{ card.priority_name() }}</li>
           {% endif %}
           {% if card.agent.is_some() %}
-          <li class="agent-chip" data-agent="{{ card.agent_slug() }}"><span class="visually-hidden">Agent : </span>{{ card.agent_name() }}</li>
+          <li class="agent-chip" data-agent="{{ card.agent_slug() }}"><span class="visually-hidden">Agent : </span>{{ card.agent_name() }}{% if let Some(status) = card.run_status %} <span class="run-status" data-status="{{ status.slug() }}">{{ status.label() }}</span>{% endif %}</li>
           {% endif %}
           {% for label in card.labels %}
           <li class="label" data-slot="{{ label.color_slot }}">{{ label.name }}</li>

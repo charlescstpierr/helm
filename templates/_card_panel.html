@@ -1,4 +1,10 @@
 {% include "_card_form.html" %}
+{% if card.agent.is_some() || activity.run.is_some() %}
+<section class="activity-section" aria-labelledby="activity-title">
+  <h3 class="activity-section__title" id="activity-title">Activité de l'agent</h3>
+  {% include "_activity.html" %}
+</section>
+{% endif %}
 <section class="comments" aria-labelledby="comments-title">
   <h3 class="comments__title" id="comments-title">Commentaires</h3>
   {% include "_thread.html" %}

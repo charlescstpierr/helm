@@ -55,6 +55,7 @@ mod tests {
             comment_count: 0,
             agent: None,
             model: None,
+            run_status: None,
         }
     }
 

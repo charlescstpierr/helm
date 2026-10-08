@@ -1,0 +1,52 @@
+<div class="activity" id="run-activity">
+  {% if let Some(run) = activity.run %}
+  <div class="activity__header">
+    <span class="run-status" data-status="{{ run.status.slug() }}">{{ run.status.label() }}</span>
+    <span class="activity__title">Exécution {{ run.id }} · {{ run.agent.name() }}{% if let Some(model) = run.model %} · {{ model }}{% endif %}</span>
+    {% if run.status.is_active() %}
+    <form class="activity__cancel" method="post" action="/runs/{{ run.id }}/cancel" data-run-form>
+      <button class="button button--danger" type="submit">Annuler l'exécution</button>
+    </form>
+    {% endif %}
+  </div>
+  {% if let Some(error) = run.error %}
+  <p class="form__error" role="alert">{{ error }}</p>
+  {% endif %}
+  <dl class="activity__facts">
+    {% if let Some(branch) = run.branch %}<div><dt>Branche</dt><dd><code>{{ branch }}</code>{% if run.pushed_at.is_some() %} (poussée sur origin){% endif %}</dd></div>{% endif %}
+    {% if let Some(path) = run.worktree_path %}<div><dt>Worktree</dt><dd><code>{{ path }}</code></dd></div>{% endif %}
+    {% if let Some(session) = run.session_id %}<div><dt>Session</dt><dd><code>{{ session }}</code></dd></div>{% endif %}
+    {% if !activity.duration_display().is_empty() %}<div><dt>Durée</dt><dd>{{ activity.duration_display() }}</dd></div>{% endif %}
+    {% if !run.cost_display().is_empty() %}<div><dt>Coût</dt><dd>{{ run.cost_display() }}</dd></div>{% endif %}
+    {% if !run.tokens_display().is_empty() %}<div><dt>Jetons (entrée → sortie)</dt><dd>{{ run.tokens_display() }}</dd></div>{% endif %}
+  </dl>
+  {% if activity.events.is_empty() %}
+  <p class="activity__empty">Aucun événement pour l'instant.</p>
+  {% else %}
+  <ol class="activity__events">
+    {% for event in activity.events %}
+    <li class="event" data-kind="{{ event.kind.slug() }}">
+      <time class="event__time" datetime="{{ event.time_iso() }}">{{ event.time_display() }}</time>
+      <span class="event__kind">{{ event.kind.label() }}</span>
+      <span class="event__summary">{{ event.summary }}</span>
+    </li>
+    {% endfor %}
+  </ol>
+  {% endif %}
+  {% if activity.hidden_events() > 0 %}
+  <p class="field__hint">{{ activity.total_events }} événements enregistrés, {{ activity.hidden_events() }} non affichés (bruit interne du CLI, ou plus anciens que les {{ activity.events.len() }} derniers).</p>
+  {% endif %}
+  {% if !run.stderr.is_empty() %}
+  <details class="activity__details">
+    <summary>Sortie d'erreur</summary>
+    <pre>{{ run.stderr }}</pre>
+  </details>
+  {% endif %}
+  <details class="activity__details">
+    <summary>Consigne envoyée à l'agent</summary>
+    <pre>{{ run.prompt }}</pre>
+  </details>
+  {% else %}
+  <p class="activity__empty">Aucune exécution. L'agent démarre quand la carte entre dans une colonne « À faire ».</p>
+  {% endif %}
+</div>
