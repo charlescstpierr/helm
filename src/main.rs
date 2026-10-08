@@ -1,5 +1,8 @@
 //! Helm: a self-hosted kanban that will orchestrate coding agents. See `docs/architecture.md`.
 
+// Consumed by the supervisor, which arrives later in the same stack.
+#[allow(dead_code)]
+mod adapter;
 mod agent;
 mod assets;
 mod config;
