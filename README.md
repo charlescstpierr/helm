@@ -61,7 +61,7 @@ de `agents.claude.model`, sinon celui du CLI). Quand la carte **entre** dans une
 faire », une exécution est mise en file : Helm crée le worktree `<racine>/<CLÉ>-<n>` sur la
 branche `helm/<CLÉ>-<n>`, lance `claude -p` dedans (mode `bypassPermissions` par défaut), garde
 chaque événement du flux (affiché en direct dans « Activité de l'agent » : statut, branche, session, coût, jetons, journal, sortie d'erreur, consigne), puis pousse la branche vers `origin`. Succès : la carte
-passe en « En revue ». Échec (agent, absence de commit, push refusé) : elle reste « En cours » et
+passe en « En revue » si elle est encore « En cours » (déplacée à la main entre-temps, elle y reste). Échec (agent, absence de commit, push refusé) : elle reste « En cours » et
 l'erreur est affichée sur la carte et ajoutée à son fil. Aucune PR n'est ouverte et les worktrees ne sont pas nettoyés.
 Une ligne de sortie de plus de 1 Mio est tronquée (son début est gardé, le journal le signale) sans
 interrompre l'exécution. Un agent encore actif après `agents.run_timeout_minutes` est arrêté comme
