@@ -62,8 +62,10 @@ branche `helm/<CLÉ>-<n>`, lance `claude -p` dedans (mode `bypassPermissions` pa
 chaque événement du flux (affiché en direct dans « Activité de l'agent » : statut, branche, session, coût, jetons, journal, sortie d'erreur, consigne), puis pousse la branche vers `origin`. Succès : la carte
 passe en « En revue ». Échec (agent, absence de commit, push refusé) : elle reste « En cours » et
 l'erreur est affichée sur la carte et ajoutée à son fil. Aucune PR n'est ouverte et les worktrees ne sont pas nettoyés.
-Une exécution en cours peut être annulée depuis la carte ; si Helm s'arrête pendant une
-exécution, celle-ci est marquée « interrompue » au redémarrage et n'est jamais relancée seule.
+Une exécution en cours peut être annulée depuis la carte. Un arrêt normal de Helm (SIGINT, SIGTERM)
+arrête les agents de la même façon (SIGTERM au groupe de processus, puis SIGKILL après 3 s) et marque
+l'exécution « interrompue ». Si Helm est tué sans préavis, l'exécution est marquée « interrompue »
+au redémarrage ; elle n'est jamais relancée seule.
 
 ## Architecture
 

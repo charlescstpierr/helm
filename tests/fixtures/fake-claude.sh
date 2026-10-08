@@ -53,6 +53,14 @@ group_child)
     sed -n 2p "$here/claude-success.jsonl"
     wait
     ;;
+session_child)
+    setsid sleep 300 &
+    child=$!
+    trap 'kill $child; exit 143' TERM
+    echo $child > "$(pwd).child"
+    sed -n 2p "$here/claude-success.jsonl"
+    wait
+    ;;
 silent_success)
     commit
     ;;

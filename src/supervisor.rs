@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,6 +34,8 @@ use crate::store::{self, Author, Category, StoreError};
 /// How often a busy run tells the open browsers it has news.
 const PUBLISH_EVERY: Duration = Duration::from_millis(250);
 const TERMINATE_GRACE: Duration = Duration::from_secs(3);
+/// How long a shutdown waits for the runs it stopped to record their end.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
 const STDERR_DRAIN: Duration = Duration::from_secs(2);
 const STDERR_KEPT_BYTES: usize = 256 * 1024;
 
@@ -49,6 +52,8 @@ struct Shared {
     wake: Notify,
     /// One handle per running run, inserted when the run is claimed and removed when it ends.
     cancels: Mutex<HashMap<RunId, Arc<Notify>>>,
+    /// Set once Helm is shutting down: no run is claimed, and every running one is stopped.
+    stopping: AtomicBool,
 }
 
 /// The HTTP side: queues and cancels. Cheap to clone.
@@ -65,6 +70,7 @@ impl Orchestrator {
                 claude,
                 wake: Notify::new(),
                 cancels: Mutex::new(HashMap::new()),
+                stopping: AtomicBool::new(false),
             }),
         }
     }
@@ -159,6 +165,27 @@ impl Orchestrator {
         .await
     }
 
+    /// Stops every running run the way a cancel does (the agent's whole process group gets
+    /// SIGTERM, then SIGKILL after a grace period) and waits for each to record that it was
+    /// interrupted. Queued runs stay queued for the next start.
+    pub async fn shutdown(&self) {
+        {
+            let cancels = lock(&self.shared.cancels);
+            self.shared.stopping.store(true, Ordering::SeqCst);
+            for handle in cancels.values() {
+                handle.notify_one();
+            }
+        }
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_WAIT;
+        while !lock(&self.shared.cancels).is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    fn stopping(&self) -> bool {
+        self.shared.stopping.load(Ordering::SeqCst)
+    }
+
     fn cancel_handle(&self, id: RunId) -> Option<Arc<Notify>> {
         lock(&self.shared.cancels).get(&id).cloned()
     }
@@ -166,9 +193,17 @@ impl Orchestrator {
     /// Claims the oldest queued run and registers its cancel handle in the same step, so a
     /// cancel can never see a running run without one.
     fn claim_next(&self, conn: &mut Connection) -> Result<Option<Run>, StoreError> {
+        if self.stopping() {
+            return Ok(None);
+        }
         let run = runs::claim_next_queued(conn)?;
         if let Some(run) = &run {
-            lock(&self.shared.cancels).insert(run.id, Arc::new(Notify::new()));
+            let mut cancels = lock(&self.shared.cancels);
+            let handle = Arc::new(Notify::new());
+            if self.stopping() {
+                handle.notify_one();
+            }
+            cancels.insert(run.id, handle);
         }
         Ok(run)
     }
@@ -190,6 +225,8 @@ fn log_store_error(context: &str, error: &StoreError) {
     eprintln!("helm: {context}: {error}");
 }
 
+const STOPPED_BY_SHUTDOWN: &str = "Helm s'est arrêté pendant l'exécution.";
+
 /// Marks every run left `running` by a previous Helm as `interrupted`. Nothing is relaunched:
 /// whether to try again is the human's call. Returns how many runs were interrupted.
 pub async fn recover(db: &Db, changes: &Changes) -> Result<usize, StoreError> {
@@ -201,7 +238,7 @@ pub async fn recover(db: &Db, changes: &Changes) -> Result<usize, StoreError> {
                 let reason = if still_alive {
                     "Helm s'est arrêté pendant l'exécution. Le processus de l'agent existe encore mais n'est plus supervisé."
                 } else {
-                    "Helm s'est arrêté pendant l'exécution."
+                    STOPPED_BY_SHUTDOWN
                 };
                 runs::finish(conn, orphan.id, &Outcome::Interrupted(reason.to_owned()))?;
                 comment(
@@ -404,7 +441,7 @@ impl Supervisor {
         )
         .await;
         let worktree = match prepared {
-            None => return Outcome::Cancelled,
+            None => return self.stopped(),
             Some(Err(e)) => return Outcome::Failed(format!("worktree impossible : {e}")),
             Some(Ok(worktree)) => worktree,
         };
@@ -452,13 +489,13 @@ impl Supervisor {
             None => {
                 terminate(&mut child, group.as_ref()).await;
                 self.record_stderr(id, None, stderr_task).await;
-                self.note(
-                    id,
-                    EventKind::Notice,
-                    "Annulée par l'utilisateur.".to_owned(),
-                )
-                .await;
-                return Outcome::Cancelled;
+                let outcome = self.stopped();
+                let notice = match &outcome {
+                    Outcome::Interrupted(why) => why.clone(),
+                    _ => "Annulée par l'utilisateur.".to_owned(),
+                };
+                self.note(id, EventKind::Notice, notice).await;
+                return outcome;
             }
         };
         let stderr = self.record_stderr(id, exit.code, stderr_task).await;
@@ -691,7 +728,7 @@ impl Supervisor {
         )
         .await;
         match unless_cancelled(cancel, git::push(&worktree.path, &worktree.branch)).await {
-            None => Outcome::Cancelled,
+            None => self.stopped(),
             Some(Err(e)) => self.fail(id, format!("git push a échoué : {e}")).await,
             Some(Ok(())) => {
                 self.note(
@@ -702,6 +739,16 @@ impl Supervisor {
                 .await;
                 Outcome::Succeeded
             }
+        }
+    }
+
+    /// How a run ends when it was told to stop: cancelled by a human, or interrupted because
+    /// Helm itself is going away.
+    fn stopped(&self) -> Outcome {
+        if self.orchestrator.stopping() {
+            Outcome::Interrupted(STOPPED_BY_SHUTDOWN.to_owned())
+        } else {
+            Outcome::Cancelled
         }
     }
 
@@ -743,10 +790,15 @@ impl Supervisor {
                             format!("Exécution {id} réussie : la branche `{branch}` est poussée sur origin."),
                         )
                     }
-                    Outcome::Failed(why) | Outcome::Interrupted(why) => comment(
+                    Outcome::Failed(why) => comment(
                         conn,
                         run.card_id,
                         format!("Exécution {id} échouée : {why}"),
+                    ),
+                    Outcome::Interrupted(why) => comment(
+                        conn,
+                        run.card_id,
+                        format!("Exécution {id} interrompue : {why}"),
                     ),
                     Outcome::Cancelled => {
                         comment(conn, run.card_id, format!("Exécution {id} annulée."))
@@ -1219,14 +1271,18 @@ mod tests {
         ));
     }
 
+    enum Stop {
+        Cancel,
+        Shutdown,
+    }
+
     fn gone(pid: i64) -> bool {
         !process_exists(pid) || is_zombie(pid)
     }
 
-    #[tokio::test]
-    async fn cancelling_a_run_stops_every_process_of_the_agents_group() {
-        let h = Harness::new("sup-cancel-group");
-        let card = h.card("group_child", "").await;
+    async fn assert_stop_reaps_the_agents_children(name: &str, scenario: &str, stop: Stop) {
+        let h = Harness::new(name);
+        let card = h.card(scenario, "").await;
         let running = h.wait_for(card, |r| r.status == RunStatus::Running).await;
         let marker = h.remote.worktrees.join("HELM-1.child");
         let mut child = None;
@@ -1240,19 +1296,44 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         let child = child.expect("the agent started a child");
-        assert!(!gone(child), "the child runs before the cancel");
+        assert!(!gone(child), "the child runs before the stop");
 
-        h.orchestrator.cancel(&h.db, running.id).await.unwrap();
+        match stop {
+            Stop::Cancel => {
+                h.orchestrator.cancel(&h.db, running.id).await.unwrap();
+            }
+            Stop::Shutdown => h.orchestrator.shutdown().await,
+        }
         let run = h.settled(card).await;
 
-        assert_eq!(run.status, RunStatus::Cancelled, "{:?}", run.error);
+        let expected = match stop {
+            Stop::Cancel => RunStatus::Cancelled,
+            Stop::Shutdown => RunStatus::Interrupted,
+        };
+        assert_eq!(run.status, expected, "{scenario}: {:?}", run.error);
         for _ in 0..200 {
             if gone(child) {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        panic!("the agent's child {child} outlived the cancel");
+        panic!("{scenario}: the agent's child {child} outlived the stop");
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_run_stops_the_agents_children_too() {
+        assert_stop_reaps_the_agents_children("sup-cancel-group", "group_child", Stop::Cancel)
+            .await;
+        assert_stop_reaps_the_agents_children("sup-cancel-session", "session_child", Stop::Cancel)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn shutting_down_stops_the_agents_children_too_and_interrupts_the_run() {
+        assert_stop_reaps_the_agents_children("sup-stop-group", "group_child", Stop::Shutdown)
+            .await;
+        assert_stop_reaps_the_agents_children("sup-stop-session", "session_child", Stop::Shutdown)
+            .await;
     }
 
     fn is_zombie(pid: i64) -> bool {
