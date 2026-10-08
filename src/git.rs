@@ -205,6 +205,36 @@ pub async fn prepare_worktree(
     Ok(Worktree { path, branch })
 }
 
+/// Reuses only the saved checkout for a correction. Its branch and repository must still
+/// match; missing worktrees are not recreated, and unfinished files are left untouched.
+pub async fn resume_worktree(repo: &Path, path: &Path, branch: &str) -> Result<Worktree> {
+    if !tokio::fs::metadata(path)
+        .await
+        .is_ok_and(|metadata| metadata.is_dir())
+    {
+        return error(format!(
+            "Le worktree à reprendre est introuvable ou inaccessible : {}",
+            path.display()
+        ));
+    }
+    if !belongs_to_repository(repo, path).await? {
+        return error(format!(
+            "{} n'est pas la racine d'un worktree de ce dépôt",
+            path.display()
+        ));
+    }
+    let current = git(path, &["symbolic-ref", "--short", "HEAD"]).await?;
+    if current != branch {
+        return error(format!(
+            "Le worktree à reprendre est sur la branche {current}, attendue : {branch}"
+        ));
+    }
+    Ok(Worktree {
+        path: path.to_owned(),
+        branch: branch.to_owned(),
+    })
+}
+
 /// What a push of the card's branch would put on origin.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Unpublished {
@@ -454,6 +484,150 @@ mod tests {
             .await
             .unwrap();
         assert!(revived.path.join("work.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn resuming_the_existing_worktree_preserves_commits_staged_and_untracked_changes() {
+        let remote = Remote::new("git-resume-existing");
+        let wt = card_worktree(&remote).await;
+        commit(&wt, "first-attempt.txt").await;
+        std::fs::write(wt.path.join("README.md"), "Correction in progress\n").unwrap();
+        run(&wt.path, &["add", "README.md"]);
+        std::fs::write(wt.path.join("notes.txt"), "keep these notes").unwrap();
+        let head = run(&wt.path, &["rev-parse", "HEAD"]);
+        let status = run(&wt.path, &["status", "--porcelain"]);
+
+        let resumed = resume_worktree(&remote.repo, &wt.path, &wt.branch)
+            .await
+            .unwrap();
+
+        assert_eq!(resumed, wt);
+        assert_eq!(run(&wt.path, &["rev-parse", "HEAD"]), head);
+        assert_eq!(run(&wt.path, &["status", "--porcelain"]), status);
+        assert_eq!(
+            std::fs::read_to_string(wt.path.join("notes.txt")).unwrap(),
+            "keep these notes"
+        );
+    }
+
+    #[tokio::test]
+    async fn resuming_a_deleted_worktree_neither_recreates_it_nor_prunes_its_record() {
+        let remote = Remote::new("git-resume-missing");
+        let wt = card_worktree(&remote).await;
+        commit(&wt, "first-attempt.txt").await;
+        let head = run(&remote.repo, &["rev-parse", &wt.branch]);
+        std::fs::remove_dir_all(&wt.path).unwrap();
+        let registered = run(&remote.repo, &["worktree", "list", "--porcelain"]);
+
+        assert!(
+            resume_worktree(&remote.repo, &wt.path, &wt.branch)
+                .await
+                .is_err()
+        );
+
+        assert!(!wt.path.exists());
+        assert_eq!(run(&remote.repo, &["rev-parse", &wt.branch]), head);
+        assert_eq!(
+            run(&remote.repo, &["worktree", "list", "--porcelain"]),
+            registered
+        );
+    }
+
+    #[tokio::test]
+    async fn resuming_a_worktree_in_another_repository_is_refused_without_changes() {
+        let remote = Remote::new("git-resume-repo");
+        let other = Remote::new("git-resume-other-repo");
+        let foreign = card_worktree(&other).await;
+        std::fs::write(foreign.path.join("notes.txt"), "keep foreign notes").unwrap();
+
+        assert!(
+            resume_worktree(&remote.repo, &foreign.path, &foreign.branch)
+                .await
+                .is_err()
+        );
+
+        assert_eq!(
+            run(&foreign.path, &["symbolic-ref", "--short", "HEAD"]),
+            foreign.branch
+        );
+        assert_eq!(
+            std::fs::read_to_string(foreign.path.join("notes.txt")).unwrap(),
+            "keep foreign notes"
+        );
+    }
+
+    #[tokio::test]
+    async fn resuming_with_a_different_branch_or_detached_head_does_not_switch_it() {
+        let remote = Remote::new("git-resume-branch");
+        let wt = card_worktree(&remote).await;
+        run(&wt.path, &["checkout", "-q", "-b", "other-work"]);
+        std::fs::write(wt.path.join("notes.txt"), "keep current notes").unwrap();
+
+        assert!(
+            resume_worktree(&remote.repo, &wt.path, &wt.branch)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            run(&wt.path, &["symbolic-ref", "--short", "HEAD"]),
+            "other-work"
+        );
+
+        run(&wt.path, &["checkout", "-q", "--detach"]);
+        assert!(
+            resume_worktree(&remote.repo, &wt.path, &wt.branch)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            run(&wt.path, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "HEAD"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.path.join("notes.txt")).unwrap(),
+            "keep current notes"
+        );
+    }
+
+    #[tokio::test]
+    async fn resuming_a_subdirectory_of_the_expected_worktree_is_refused() {
+        let remote = Remote::new("git-resume-subdir");
+        let wt = card_worktree(&remote).await;
+        let subdir = wt.path.join("src");
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::write(subdir.join("notes.txt"), "keep nested notes").unwrap();
+
+        assert!(
+            resume_worktree(&remote.repo, &subdir, &wt.branch)
+                .await
+                .is_err()
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(subdir.join("notes.txt")).unwrap(),
+            "keep nested notes"
+        );
+    }
+
+    #[tokio::test]
+    async fn resuming_a_plain_directory_or_file_is_refused_without_modifying_it() {
+        let remote = Remote::new("git-resume-not-checkout");
+        let path = remote.dir.join("plain");
+        std::fs::create_dir_all(&path).unwrap();
+        let file = path.join("notes.txt");
+        std::fs::write(&file, "keep plain notes").unwrap();
+
+        assert!(
+            resume_worktree(&remote.repo, &path, "helm/HELM-1")
+                .await
+                .is_err()
+        );
+        assert!(
+            resume_worktree(&remote.repo, &file, "helm/HELM-1")
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "keep plain notes");
     }
 
     async fn commit(wt: &Worktree, file: &str) {

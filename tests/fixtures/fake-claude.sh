@@ -6,6 +6,15 @@ here=$(dirname "$0")
 prompt=$(cat)
 scenario=$(printf '%s\n' "$prompt" | sed -n 's/^SCENARIO: //p' | head -n 1)
 printf '%s\n' "$@" > "$(pwd).args"
+printf '%s' "$prompt" > "$(pwd).prompt"
+resume_session=
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = --resume ]; then
+        resume_session=$2
+        shift
+    fi
+    shift
+done
 
 commit() {
     echo "hello" > HELLO.md
@@ -14,6 +23,29 @@ commit() {
 }
 
 case "$scenario" in
+review|resume_expired|resume_wrong_session|resume_unconfirmed)
+    if [ -n "$resume_session" ]; then
+        if [ "$scenario" = resume_expired ]; then
+            echo "No conversation found with session ID: $resume_session" >&2
+            exit 1
+        fi
+        printf 'reviewed\n' >> HELLO.md
+        git add HELLO.md
+        git -c user.name=Fake -c user.email=fake@example.com commit -q -m "Apply review feedback"
+    elif [ -e HELLO.md ]; then
+        echo "A review must resume the previous session" >&2
+        exit 1
+    else
+        commit
+    fi
+    if [ "$scenario" = resume_wrong_session ] && [ -n "$resume_session" ]; then
+        sed 's/d157be31-f3e0-44f0-9aa9-7c88253236bf/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/g' "$here/claude-success.jsonl"
+    elif [ "$scenario" = resume_unconfirmed ] && [ -n "$resume_session" ]; then
+        sed 's/,"session_id":"[^"]*"//g; s/"session_id":"[^"]*",//g' "$here/claude-success.jsonl"
+    else
+        cat "$here/claude-success.jsonl"
+    fi
+    ;;
 success)
     commit
     cat "$here/claude-success.jsonl"

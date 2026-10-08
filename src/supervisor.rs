@@ -114,9 +114,9 @@ impl Orchestrator {
     /// entered a different column.
     ///
     /// Entering a `todo` column with an agent assigned queues a run, if the gate is open and
-    /// the card's single run slot is free. Sitting in any other column, a card has no queued
-    /// run: it is cancelled. Edits that leave the card in place change nothing, so a failed
-    /// run is never retried by saving the form.
+    /// the card's single run slot is free. Moving elsewhere cancels a queued run. Edits that
+    /// leave the card in place preserve an explicitly queued correction and never retry a
+    /// failed run. Entering `todo` replaces a queued correction with a fresh conversation.
     pub fn after_placement(
         &self,
         conn: &mut Connection,
@@ -125,11 +125,18 @@ impl Orchestrator {
     ) -> Result<(), StoreError> {
         self.ensure_card_available(card_id)?;
         if store::card_category(conn, card_id)? != Category::Todo {
-            runs::cancel_queued(conn, card_id)?;
+            if entered_column {
+                runs::cancel_queued(conn, card_id)?;
+            }
             return Ok(());
         }
         if !entered_column || self.shared.gate != RunGate::Open {
             return Ok(());
+        }
+        if runs::latest_run(conn, card_id)?
+            .is_some_and(|run| run.status == RunStatus::Queued && run.resumed_from.is_some())
+        {
+            runs::cancel_queued(conn, card_id)?;
         }
         let card = store::get_card(conn, card_id)?;
         let Some(agent) = card.agent else {
@@ -159,6 +166,38 @@ impl Orchestrator {
             self.shared.wake.notify_one();
         }
         Ok(())
+    }
+
+    /// Explicitly continues the latest conversation with an atomic feedback/run snapshot.
+    pub fn resume(
+        &self,
+        conn: &mut Connection,
+        card_id: i64,
+        source_id: RunId,
+        feedback: &str,
+    ) -> Result<RunId, StoreError> {
+        if self.shared.gate != RunGate::Open {
+            return Err(StoreError::Invalid(
+                self.shared
+                    .gate
+                    .notice()
+                    .unwrap_or("Agents indisponibles.")
+                    .to_owned(),
+            ));
+        }
+        if self.stopping() {
+            return Err(StoreError::Conflict(
+                "Helm s'arrête. Réessayez après son redémarrage.".to_owned(),
+            ));
+        }
+        self.ensure_card_available(card_id)
+            .map_err(|error| match error {
+                StoreError::Invalid(message) => StoreError::Conflict(message),
+                other => other,
+            })?;
+        let id = crate::resume::enqueue(conn, card_id, source_id, feedback)?;
+        self.shared.wake.notify_one();
+        Ok(id)
     }
 
     /// Cancels a run and returns the id of its card. A queued run is cancelled at once; a
@@ -329,6 +368,12 @@ enum Ended {
     Exited(Exit),
     Cancelled,
     TimedOut,
+    Rejected(String),
+}
+
+enum ReadEnded {
+    Exited(ExitStatus),
+    Rejected(String),
 }
 
 fn describe(duration: Duration) -> String {
@@ -540,10 +585,48 @@ impl Supervisor {
             Ok(_) => {}
         }
 
-        let prepared = unless_cancelled(
-            cancel,
-            git::prepare_worktree(&self.config.repo, &self.config.worktree_root, &key, number),
-        )
+        let resume = if run.resumed_from.is_some() {
+            let snapshot = run.clone();
+            match self
+                .db
+                .call(move |conn| crate::resume::context(conn, &snapshot))
+                .await
+            {
+                Ok(context) if context.branch == git::branch_name(&key, number) => Some(context),
+                Ok(_) => {
+                    return self
+                        .fail(
+                            id,
+                            "La branche de la session ne correspond plus à cette carte.".to_owned(),
+                        )
+                        .await;
+                }
+                Err(error) => return self.fail(id, format!("Reprise impossible : {error}")).await,
+            }
+        } else {
+            None
+        };
+        let prepared = unless_cancelled(cancel, async {
+            match &resume {
+                Some(context) => {
+                    git::resume_worktree(
+                        &self.config.repo,
+                        std::path::Path::new(&context.worktree_path),
+                        &context.branch,
+                    )
+                    .await
+                }
+                None => {
+                    git::prepare_worktree(
+                        &self.config.repo,
+                        &self.config.worktree_root,
+                        &key,
+                        number,
+                    )
+                    .await
+                }
+            }
+        })
         .await;
         let worktree = match prepared {
             None => return self.stopped(),
@@ -570,7 +653,32 @@ impl Supervisor {
         )
         .await;
 
-        let mut child = match self.spawn_agent(run, &worktree.path) {
+        if let Some(context) = &resume {
+            if let Some(delivery) = &self.delivery {
+                match unless_cancelled(cancel, delivery.validate_resume(run)).await {
+                    None => return self.stopped(),
+                    Some(Err(error)) => {
+                        return self.fail(id, format!("Reprise impossible : {error}")).await;
+                    }
+                    Some(Ok(())) => {}
+                }
+            }
+            self.note(
+                id,
+                EventKind::Notice,
+                format!(
+                    "Reprise de la session {} depuis l'exécution {}.",
+                    context.session_id,
+                    run.resumed_from.expect("resume source")
+                ),
+            )
+            .await;
+        }
+        let mut child = match self.spawn_agent(
+            run,
+            &worktree.path,
+            resume.as_ref().map(|context| context.session_id.as_str()),
+        ) {
             Ok(child) => child,
             Err(e) => return Outcome::Failed(e),
         };
@@ -584,9 +692,22 @@ impl Supervisor {
         let stderr_task = tokio::spawn(read_capped(child.stderr.take()));
 
         let mut finish = None;
-        let ended = self.stream(run, &mut child, &mut finish, cancel).await;
+        let ended = self
+            .stream(
+                run,
+                &mut child,
+                &mut finish,
+                cancel,
+                resume.as_ref().map(|context| context.session_id.as_str()),
+            )
+            .await;
         let exit = match ended {
             Ended::Exited(exit) => exit,
+            Ended::Rejected(why) => {
+                terminate(&mut child, group.as_ref()).await;
+                self.record_stderr(id, None, stderr_task).await;
+                return self.fail(id, why).await;
+            }
             Ended::TimedOut => {
                 terminate(&mut child, group.as_ref()).await;
                 self.record_stderr(id, None, stderr_task).await;
@@ -613,11 +734,23 @@ impl Supervisor {
             self.note(id, EventKind::Error, why.clone()).await;
             return Outcome::Failed(why);
         }
+        if let Some(context) = &resume {
+            let recorded = self.db.call(move |conn| runs::get_run(conn, id)).await;
+            match recorded {
+                Ok(run) if run.session_id.as_deref() == Some(context.session_id.as_str()) => {}
+                _ => return self.fail(id, "La session demandée n'a pas été confirmée par le CLI et enregistrée. Aucun commit n'est poussé.".to_owned()).await,
+            }
+        }
 
         self.publish_branch(id, &worktree, cancel).await
     }
 
-    fn spawn_agent(&self, run: &Run, cwd: &std::path::Path) -> Result<Child, String> {
+    fn spawn_agent(
+        &self,
+        run: &Run,
+        cwd: &std::path::Path,
+        resume_session_id: Option<&str>,
+    ) -> Result<Child, String> {
         if self.adapter.agent() != run.agent {
             return Err(format!(
                 "aucun adaptateur pour l'agent {} dans cette configuration",
@@ -628,6 +761,7 @@ impl Supervisor {
             prompt: &run.prompt,
             model: run.model.as_ref(),
             permission_mode: run.permission_mode,
+            resume_session_id,
         });
         let mut child = Command::new(&spec.program)
             .args(&spec.args)
@@ -657,6 +791,7 @@ impl Supervisor {
         child: &mut Child,
         finish: &mut Option<Finish>,
         cancel: &Notify,
+        resume_session_id: Option<&str>,
     ) -> Ended {
         let id = run.id;
         let Some(stdout) = child.stdout.take() else {
@@ -684,7 +819,14 @@ impl Supervisor {
                                 self.adapter.parse_line(&text)
                             };
                             line.clear();
-                            if let Some(parsed) = parsed {
+                            if let Some(mut parsed) = parsed {
+                                if resume_session_id.is_some_and(|expected| parsed.session_id.as_deref().is_some_and(|actual| actual != expected)) {
+                                    // Keep the event for diagnosis, but never make this accidental
+                                    // conversation the source of another correction.
+                                    parsed.session_id = None;
+                                    self.store_line(id, parsed, &mut session_recorded, finish).await;
+                                    return Ok(ReadEnded::Rejected("Le CLI a annoncé une autre session que celle demandée. La reprise est arrêtée sans push.".to_owned()));
+                                }
                                 self.store_line(id, parsed, &mut session_recorded, finish).await;
                                 unpublished = true;
                             }
@@ -700,7 +842,7 @@ impl Supervisor {
                     }
                 }
             }
-            child.wait().await
+            child.wait().await.map(ReadEnded::Exited)
         };
         let limited = tokio::time::timeout(self.config.run_timeout, reading);
         let Some(timed) = unless_cancelled(cancel, limited).await else {
@@ -708,7 +850,8 @@ impl Supervisor {
         };
         match timed {
             Err(_) => Ended::TimedOut,
-            Ok(Ok(status)) => Ended::Exited(status.into()),
+            Ok(Ok(ReadEnded::Exited(status))) => Ended::Exited(status.into()),
+            Ok(Ok(ReadEnded::Rejected(why))) => Ended::Rejected(why),
             Ok(Err(e)) => {
                 self.note(
                     id,
@@ -1292,6 +1435,15 @@ mod tests {
                 .unwrap();
         }
 
+        async fn resume(&self, card: i64, source: RunId, feedback: &str) -> RunId {
+            let orchestrator = self.orchestrator.clone();
+            let feedback = feedback.to_owned();
+            self.db
+                .call(move |conn| orchestrator.resume(conn, card, source, &feedback))
+                .await
+                .unwrap()
+        }
+
         fn restart(&mut self) {
             self.task.abort();
             self.task = tokio::spawn(Self::supervisor(
@@ -1434,6 +1586,256 @@ mod tests {
         fn drop(&mut self) {
             self.task.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn a_missing_resume_worktree_is_not_recreated_and_no_agent_is_started() {
+        let h = Harness::new("sup-resume-missing-worktree");
+        let card = h.card("review", "").await;
+        let first = h.settled(card).await;
+        let path = first.worktree_path.unwrap();
+        git_run(&h.remote.repo, &["worktree", "remove", &path]);
+        let id = h.resume(card, first.id, "Corrige ce détail.").await;
+        let run = h
+            .wait_for(card, |run| run.id == id && !run.status.is_active())
+            .await;
+        assert_eq!(run.status, RunStatus::Failed);
+        assert!(run.error.as_deref().unwrap().contains("worktree"));
+        assert!(run.pid.is_none());
+        assert!(!std::path::Path::new(&path).exists());
+    }
+
+    #[tokio::test]
+    async fn an_expired_session_fails_visibly_without_starting_a_fresh_conversation() {
+        let h = Harness::new("sup-resume-expired");
+        let card = h.card("resume_expired", "").await;
+        let first = h.settled(card).await;
+        let original_head = git_run(&h.remote.origin, &["rev-parse", "helm/HELM-1"]);
+        let id = h.resume(card, first.id, "Corrige ce détail.").await;
+        let run = h
+            .wait_for(card, |run| run.id == id && !run.status.is_active())
+            .await;
+        assert_eq!(run.status, RunStatus::Failed);
+        assert!(
+            run.error
+                .as_deref()
+                .unwrap()
+                .contains("No conversation found")
+        );
+        assert_eq!(
+            git_run(&h.remote.origin, &["rev-parse", "helm/HELM-1"]),
+            original_head
+        );
+        assert_eq!(run.resumed_from, Some(first.id));
+        let context =
+            h.db.call(move |conn| crate::resume::context(conn, &run))
+                .await
+                .unwrap();
+        assert_eq!(Some(context.session_id), first.session_id);
+    }
+
+    #[tokio::test]
+    async fn a_pr_closed_on_github_blocks_the_resumed_agent_before_it_starts() {
+        let mut h = Harness::with_checks(
+            "sup-resume-closed-pr",
+            &["test -f HELLO.md"],
+            Duration::from_secs(2),
+        );
+        let card = h.card("review", "").await;
+        let first = h.settled(card).await;
+        let first_id = first.id;
+        let head = git_run(&h.remote.origin, &["rev-parse", "helm/HELM-1"]);
+        let state = h.remote.repo.with_extension("gh");
+        std::fs::create_dir_all(&state).unwrap();
+        let mut snapshot = github_snapshot(&head);
+        std::fs::write(state.join("view.json"), snapshot.to_string()).unwrap();
+        let client = crate::github::Github::new(crate::config::GithubConfig {
+            repository: "owner/repo".to_owned(),
+            command: PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake-gh.sh"
+            )),
+        });
+        let pr = client.refresh(&h.remote.repo, 7).await.unwrap();
+        h.db.call(move |conn| crate::delivery::record(conn, card, first_id, "owner/repo", &pr))
+            .await
+            .unwrap();
+        snapshot["state"] = serde_json::json!("CLOSED");
+        std::fs::write(state.join("view.json"), snapshot.to_string()).unwrap();
+        h.enable_github();
+        let id = h.resume(card, first.id, "Corrige ce détail.").await;
+        let run = h
+            .wait_for(card, |run| run.id == id && !run.status.is_active())
+            .await;
+        assert_eq!(run.status, RunStatus::Failed);
+        assert!(run.error.as_deref().unwrap().contains("plus ouverte"));
+        assert!(run.pid.is_none());
+        assert_eq!(
+            git_run(&h.remote.origin, &["rev-parse", "helm/HELM-1"]),
+            head
+        );
+    }
+
+    #[tokio::test]
+    async fn moving_a_queued_correction_to_todo_starts_a_fresh_attempt() {
+        let h = Harness::new("sup-resume-todo");
+        let card = h.card("review", "").await;
+        let first = h.settled(card).await;
+        h.task.abort();
+        let queued = h.resume(card, first.id, "Corrige ce détail.").await;
+        let orchestrator = h.orchestrator.clone();
+        h.db.call(move |conn| {
+            let entered = store::move_card(conn, card, 2, 0)?;
+            orchestrator.after_placement(conn, card, entered)
+        })
+        .await
+        .unwrap();
+        let next = h.latest(card).await;
+        assert_ne!(next.id, queued);
+        assert_eq!(next.resumed_from, None);
+        assert_eq!(next.status, RunStatus::Queued);
+        assert_eq!(
+            h.db.call(move |conn| runs::get_run(conn, queued))
+                .await
+                .unwrap()
+                .status,
+            RunStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn editing_a_card_does_not_cancel_its_queued_correction_but_moving_it_does() {
+        let h = Harness::new("sup-resume-edit");
+        let card = h.card("review", "").await;
+        let first = h.settled(card).await;
+        h.task.abort();
+        let queued = h.resume(card, first.id, "Corrige ce détail.").await;
+        let orchestrator = h.orchestrator.clone();
+        h.db.call(move |conn| {
+            // Saving metadata or reordering within the same column is not a cancellation.
+            orchestrator.after_placement(conn, card, false)
+        })
+        .await
+        .unwrap();
+        assert_eq!(h.latest(card).await.status, RunStatus::Queued);
+        let orchestrator = h.orchestrator.clone();
+        h.db.call(move |conn| {
+            let changed = store::move_card(conn, card, 1, 0)?;
+            orchestrator.after_placement(conn, card, changed)
+        })
+        .await
+        .unwrap();
+        assert_eq!(h.latest(card).await.id, queued);
+        assert_eq!(h.latest(card).await.status, RunStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn a_successful_resume_must_confirm_its_session_before_pushing() {
+        let h = Harness::new("sup-resume-unconfirmed");
+        let card = h.card("resume_unconfirmed", "").await;
+        let first = h.settled(card).await;
+        let original_head = git_run(&h.remote.origin, &["rev-parse", "helm/HELM-1"]);
+        let id = h.resume(card, first.id, "Corrige ce détail.").await;
+        let run = h
+            .wait_for(card, |run| run.id == id && !run.status.is_active())
+            .await;
+        assert_eq!(run.status, RunStatus::Failed);
+        assert!(run.error.as_deref().unwrap().contains("session"));
+        assert_eq!(
+            git_run(&h.remote.origin, &["rev-parse", "helm/HELM-1"]),
+            original_head
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_that_reports_another_session_does_not_publish_its_work() {
+        let h = Harness::new("sup-resume-wrong-session");
+        let card = h.card("resume_wrong_session", "").await;
+        let first = h.settled(card).await;
+        assert_eq!(first.status, RunStatus::Succeeded);
+        let original_head = git_run(&h.remote.origin, &["rev-parse", "helm/HELM-1"]);
+        let id = h.resume(card, first.id, "Corrige ce détail.").await;
+        let run = h
+            .wait_for(card, |run| run.id == id && !run.status.is_active())
+            .await;
+        assert_eq!(run.status, RunStatus::Failed, "{:?}", run.error);
+        assert!(run.error.as_deref().unwrap().contains("session"));
+        assert_eq!(
+            git_run(&h.remote.origin, &["rev-parse", "helm/HELM-1"]),
+            original_head
+        );
+        assert!(
+            h.db.call(move |conn| checks::get(conn, id))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let expected_session = first.session_id.unwrap();
+        let context =
+            h.db.call(move |conn| crate::resume::context(conn, &run))
+                .await
+                .unwrap();
+        assert_eq!(
+            context.session_id, expected_session,
+            "a later retry keeps the original session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resumed_run_keeps_its_session_workspace_and_verifies_the_new_commit() {
+        let h = Harness::with_checks(
+            "sup-resume-success",
+            &["test -f HELLO.md"],
+            Duration::from_secs(2),
+        );
+        let card = h.card("review", "haiku").await;
+        let first = h.settled(card).await;
+        assert_eq!(first.status, RunStatus::Succeeded, "{:?}", first.error);
+        let first_id = first.id;
+        // Persist a resume request as the queue will do. The supervisor must interpret
+        // its lineage, not accidentally start a fresh conversation in the same directory.
+        h.db.call(move |conn| {
+            conn.execute(
+                "INSERT INTO agent_runs (card_id, agent, model, permission_mode, prompt, resumed_from)
+                 SELECT card_id, agent, model, permission_mode, prompt || '\nFix the review finding.', id
+                 FROM agent_runs WHERE id = ?1",
+                [first_id],
+            )?;
+            Ok::<_, StoreError>(())
+        }).await.unwrap();
+        h.orchestrator.shared.wake.notify_one();
+        let second = h
+            .wait_for(card, |run| run.id != first_id && !run.status.is_active())
+            .await;
+        assert_eq!(second.status, RunStatus::Succeeded, "{:?}", second.error);
+        assert_eq!(second.session_id, first.session_id);
+        assert_eq!(second.worktree_path, first.worktree_path);
+        assert_eq!(second.branch, first.branch);
+        let arguments = std::fs::read_to_string(h.remote.worktrees.join("HELM-1.args")).unwrap();
+        assert!(arguments.contains(&format!(
+            "--resume\n{}\n",
+            first.session_id.as_deref().unwrap()
+        )));
+        let prompt = std::fs::read_to_string(h.remote.worktrees.join("HELM-1.prompt")).unwrap();
+        assert!(prompt.contains("Fix the review finding."));
+        let second_id = second.id;
+        let (before, after) =
+            h.db.call(move |conn| {
+                Ok::<_, StoreError>((
+                    checks::get(conn, first_id)?.unwrap(),
+                    checks::get(conn, second_id)?.unwrap(),
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(before.status, VerificationStatus::Passed);
+        assert_eq!(after.status, VerificationStatus::Passed);
+        assert_ne!(before.commit_sha, after.commit_sha);
+        assert_eq!(
+            after.commit_sha,
+            git_run(&h.remote.origin, &["rev-parse", "helm/HELM-1"])
+        );
+        assert_eq!(h.column_category(card).await, Category::InReview);
     }
 
     #[tokio::test]

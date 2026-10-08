@@ -79,14 +79,50 @@ pub fn record(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, unixepoch())
          ON CONFLICT (card_id) DO UPDATE SET run_id = excluded.run_id,
            repository = excluded.repository, number = excluded.number,
-           expected_base = CASE WHEN card_pull_requests.run_id = excluded.run_id
-             AND lower(card_pull_requests.repository) = lower(excluded.repository)
+           expected_base = CASE WHEN lower(card_pull_requests.repository) = lower(excluded.repository)
              AND card_pull_requests.number = excluded.number
              THEN card_pull_requests.expected_base ELSE excluded.expected_base END,
            snapshot = excluded.snapshot, refreshed_at = excluded.refreshed_at, error = NULL",
         (card_id, run_id, repository, pr.number, snapshot, &pr.base_branch),
     )?;
     Ok(())
+}
+
+/// A previous push can have succeeded while saving its GitHub snapshot failed.
+/// Trust the last confirmed push in the lineage, never a refreshed remote snapshot.
+fn resume_head(conn: &Connection, run: &Run, saved: &CardPullRequest) -> store::Result<String> {
+    let mut ancestor_id = run.resumed_from;
+    let mut child_id = run.id;
+    while let Some(id) = ancestor_id {
+        let ancestor = runs::get_run(conn, id)?;
+        if ancestor.card_id != run.card_id || id >= child_id {
+            return Err(StoreError::Invalid(
+                "La lignée de reprise est invalide.".to_owned(),
+            ));
+        }
+        if ancestor.status == RunStatus::Succeeded && ancestor.pushed_at.is_some() {
+            return verified_resume_head(conn, id);
+        }
+        child_id = id;
+        ancestor_id = ancestor.resumed_from;
+    }
+    verified_resume_head(conn, saved.run_id)
+}
+
+fn verified_resume_head(conn: &Connection, id: RunId) -> store::Result<String> {
+    let verification = checks::get(conn, id)?
+        .filter(|v| {
+            matches!(
+                v.status,
+                VerificationStatus::Passed | VerificationStatus::Skipped
+            )
+        })
+        .ok_or_else(|| {
+            StoreError::Invalid(
+                "Le commit publié de la session n'a pas de vérifications valides.".to_owned(),
+            )
+        })?;
+    Ok(verification.commit_sha)
 }
 
 /// Shared with the orchestrator. Reservation and run-slot checks happen together on the
@@ -234,6 +270,59 @@ impl Delivery {
             .map_err(|e| e.to_string())
     }
 
+    /// Read the existing PR before resuming the agent. The local run occupies the
+    /// card's slot, so a poll or a manual merge cannot replace its delivery meanwhile.
+    pub async fn validate_resume(&self, run: &Run) -> Result<(), String> {
+        if !self.enabled() || run.resumed_from.is_none() {
+            return Ok(());
+        }
+        let card_id = run.card_id;
+        let saved = self
+            .db
+            .call(move |conn| get(conn, card_id))
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(saved) = saved else {
+            return Ok(());
+        };
+        let (client, repo, repository) = self.client()?;
+        if !saved.repository.eq_ignore_ascii_case(repository) {
+            return Err("Cette PR appartient à un autre dépôt que celui configuré.".to_owned());
+        }
+        let (_reservation, run) = self.reserve(card_id, Some(run.id)).await?;
+        let number = saved.pr.number;
+        let base = saved.expected_base.clone();
+        let (branch, expected_head) = self
+            .db
+            .call(move |conn| {
+                let context = crate::resume::context(conn, &run)?;
+                let head = resume_head(conn, &run, &saved)?;
+                Ok::<_, StoreError>((context.branch, head))
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        let fresh = client.refresh(repo, number).await?;
+        if fresh.state != PullRequestState::Open {
+            return Err(
+                "La PR liée à cette carte n'est plus ouverte. La session ne peut pas être reprise."
+                    .to_owned(),
+            );
+        }
+        if fresh.head_branch != branch || fresh.base_branch != base {
+            return Err(
+                "Les branches de la PR ont changé depuis sa publication. La reprise est arrêtée."
+                    .to_owned(),
+            );
+        }
+        if fresh.head_sha != expected_head {
+            return Err(
+                "Le commit de la PR a changé hors de cette session. La reprise est arrêtée."
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+
     pub async fn publish(&self, id: RunId, expected_head: &str) -> Result<(), String> {
         let (client, repo, repository) = self.client()?;
         let run = self
@@ -254,32 +343,55 @@ impl Delivery {
             .as_deref()
             .ok_or("La branche de cette exécution est inconnue.")?;
         let card_id = run.card_id;
-        let (card, key, number) = self
-            .db
-            .call(move |conn| {
-                let (key, number) = store::card_key(conn, card_id)?;
-                Ok::<_, StoreError>((store::get_card(conn, card_id)?, key, number))
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-        let base = git::default_branch(repo).await.map_err(|e| e.to_string())?;
-        let body = self
-            .pr_body(
-                id,
-                &format!("{key}-{number}"),
-                &card.description,
-                expected_head,
-            )
-            .await?;
-        let pr = client
-            .ensure(
-                repo,
-                branch,
-                &base,
-                &format!("{key}-{number}: {}", card.title),
-                &body,
-            )
-            .await?;
+        let saved = if run.resumed_from.is_some() {
+            self.db
+                .call(move |conn| get(conn, card_id))
+                .await
+                .map_err(|e| e.to_string())?
+        } else {
+            None
+        };
+        let pr = if let Some(saved) = saved {
+            if !saved.repository.eq_ignore_ascii_case(repository) {
+                return Err("Cette PR appartient à un autre dépôt que celui configuré.".to_owned());
+            }
+            client
+                .ensure_existing(
+                    repo,
+                    saved.pr.number,
+                    branch,
+                    &saved.expected_base,
+                    expected_head,
+                )
+                .await?
+        } else {
+            let (card, key, number) = self
+                .db
+                .call(move |conn| {
+                    let (key, number) = store::card_key(conn, card_id)?;
+                    Ok::<_, StoreError>((store::get_card(conn, card_id)?, key, number))
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            let base = git::default_branch(repo).await.map_err(|e| e.to_string())?;
+            let body = self
+                .pr_body(
+                    id,
+                    &format!("{key}-{number}"),
+                    &card.description,
+                    expected_head,
+                )
+                .await?;
+            client
+                .ensure(
+                    repo,
+                    branch,
+                    &base,
+                    &format!("{key}-{number}: {}", card.title),
+                    &body,
+                )
+                .await?
+        };
         if pr.head_sha != expected_head || pr.head_branch != branch {
             return Err(
                 "La PR ne porte pas le commit vérifié. Actualisez la carte avant de continuer."
@@ -413,8 +525,7 @@ impl Delivery {
                 let expected_base = previous
                     .as_ref()
                     .filter(|old| {
-                        old.run_id == id
-                            && old.pr.number == pr.number
+                        old.pr.number == pr.number
                             && old.repository.eq_ignore_ascii_case(&repository)
                     })
                     .map_or(pr.base_branch.as_str(), |old| old.expected_base.as_str());

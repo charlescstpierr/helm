@@ -5,7 +5,31 @@ use crate::store::{AuthorKind, Card, Comment};
 
 /// `key` is the card's identifier (`HELM-12`) and `branch` the branch its worktree is on.
 pub fn build(key: &str, branch: &str, card: &Card, comments: &[Comment]) -> String {
+    build_with_feedback(key, branch, card, comments, None)
+}
+
+/// The latest correction is already a stored comment: identify it, without duplicating it.
+pub fn build_resume(
+    key: &str,
+    branch: &str,
+    card: &Card,
+    comments: &[Comment],
+    feedback_id: i64,
+) -> String {
+    build_with_feedback(key, branch, card, comments, Some(feedback_id))
+}
+
+fn build_with_feedback(
+    key: &str,
+    branch: &str,
+    card: &Card,
+    comments: &[Comment],
+    feedback_id: Option<i64>,
+) -> String {
     let mut prompt = format!("You are working on card {key}: {}\n\n", card.title);
+    if feedback_id.is_some() {
+        prompt.push_str("Continue the existing session. Apply the latest correction request below to the work already on this branch.\n\n");
+    }
     if card.description.trim().is_empty() {
         prompt.push_str("The card has no description.\n");
     } else {
@@ -15,6 +39,9 @@ pub fn build(key: &str, branch: &str, card: &Card, comments: &[Comment]) -> Stri
     if !comments.is_empty() {
         prompt.push_str("\nThe discussion on the card so far, oldest first:\n");
         for comment in comments {
+            if Some(comment.id) == feedback_id {
+                prompt.push_str("\nLatest correction request:\n");
+            }
             let who = match comment.author.kind {
                 AuthorKind::Human => "human",
                 AuthorKind::Agent => "agent",
@@ -102,5 +129,30 @@ mod tests {
         assert!(prompt.contains("The card has no description."));
         assert!(!prompt.contains("discussion"));
         assert!(prompt.contains("Commit your work"));
+    }
+
+    #[test]
+    fn resume_highlights_the_requested_feedback_once_without_losing_the_thread() {
+        let mut old = comment(AuthorKind::Human, "moi", "First request");
+        old.id = 1;
+        let mut feedback = comment(AuthorKind::Human, "moi", "Keep the error visible");
+        feedback.id = 2;
+        let text = build_resume(
+            "HELM-7",
+            "helm/HELM-7",
+            &card("Fix form", "Keep its values"),
+            &[old, feedback],
+            2,
+        );
+        assert!(text.contains("Continue the existing session"));
+        assert!(
+            text.find("First request").unwrap() < text.find("Latest correction request").unwrap()
+        );
+        assert!(
+            text.find("Latest correction request").unwrap()
+                < text.find("Keep the error visible").unwrap()
+        );
+        assert_eq!(text.matches("Keep the error visible").count(), 1);
+        assert!(text.contains("Do not push"));
     }
 }

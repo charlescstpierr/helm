@@ -3,6 +3,21 @@
 <section class="activity-section" aria-labelledby="activity-title">
   <h3 class="activity-section__title" id="activity-title">Activité de l'agent</h3>
   {% include "_activity.html" %}
+  <form class="comment-form" method="post" action="/cards/{{ card.id }}/resume" data-resume-form{% if !resume_available %} hidden{% endif %}>
+    <h4 class="activity-section__title">Demander une correction</h4>
+    <p class="form__error" role="alert" hidden></p>
+    <input type="hidden" name="source_run_id" value="{% if let Some(run) = activity.run %}{{ run.id }}{% endif %}">
+    <div class="field">
+      <label for="resume-body">Retours pour l’agent</label>
+      <textarea class="input" id="resume-body" name="body" rows="3" required maxlength="20000" aria-describedby="resume-body-hint"></textarea>
+      <p class="field__hint" id="resume-body-hint">Vos retours seront ajoutés aux commentaires. L’agent reprendra sa session sur la même branche. Si une PR est ouverte, elle sera mise à jour.</p>
+    </div>
+    <p class="notice" data-resume-notice hidden></p>
+    <div class="form__actions">
+      <button class="button" type="button" data-resume-retarget hidden>Appliquer ces retours à la nouvelle exécution</button>
+      <button class="button button--primary" type="submit"{% if !resume_available %} disabled{% endif %}>Reprendre avec ces retours</button>
+    </div>
+  </form>
 </section>
 {% endif %}
 <section class="comments" aria-labelledby="comments-title">

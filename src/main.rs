@@ -13,6 +13,7 @@ mod github;
 mod mentions;
 mod process;
 mod prompt;
+mod resume;
 mod routes;
 mod runs;
 mod store;

@@ -17,6 +17,8 @@ pub struct Launch<'a> {
     pub prompt: &'a str,
     pub model: Option<&'a ModelName>,
     pub permission_mode: PermissionMode,
+    /// Resume this stored session explicitly; never select the CLI's latest session.
+    pub resume_session_id: Option<&'a str>,
 }
 
 /// A process to start. The prompt travels on stdin: it holds the whole comment thread and
@@ -105,6 +107,10 @@ impl AgentAdapter for ClaudeAdapter {
         if let Some(model) = launch.model {
             args.push("--model".to_owned());
             args.push(model.as_str().to_owned());
+        }
+        if let Some(session_id) = launch.resume_session_id {
+            args.push("--resume".to_owned());
+            args.push(session_id.to_owned());
         }
         CommandSpec {
             program: self.command.clone(),
@@ -326,6 +332,7 @@ mod tests {
             prompt: "do it",
             model: model.as_ref(),
             permission_mode: PermissionMode::BypassPermissions,
+            resume_session_id: None,
         });
         assert_eq!(spec.program, PathBuf::from("claude"));
         assert_eq!(
@@ -347,9 +354,39 @@ mod tests {
             prompt: "x",
             model: None,
             permission_mode: PermissionMode::Plan,
+            resume_session_id: None,
         });
         assert!(!spec.args.contains(&"--model".to_owned()));
+        assert!(!spec.args.contains(&"--resume".to_owned()));
         assert_eq!(spec.args[5], "plan");
+    }
+
+    #[test]
+    fn resuming_uses_the_exact_session_and_keeps_the_feedback_on_stdin() {
+        let spec = adapter().command(&Launch {
+            prompt: "Corrige les erreurs signalées.\nGarde le contexte de la carte.",
+            model: None,
+            permission_mode: PermissionMode::AcceptEdits,
+            resume_session_id: Some("d157be31-f3e0-44f0-9aa9-7c88253236bf"),
+        });
+
+        assert_eq!(
+            spec.args,
+            [
+                "-p",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--permission-mode",
+                "acceptEdits",
+                "--resume",
+                "d157be31-f3e0-44f0-9aa9-7c88253236bf",
+            ]
+        );
+        assert_eq!(
+            spec.stdin,
+            "Corrige les erreurs signalées.\nGarde le contexte de la carte."
+        );
     }
 
     #[test]
