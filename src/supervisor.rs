@@ -886,12 +886,21 @@ impl Supervisor {
                 let run = runs::get_run(conn, id)?;
                 match &outcome {
                     Outcome::Succeeded => {
-                        store::move_to_category(conn, run.card_id, Category::InReview)?;
+                        let in_progress =
+                            store::card_category(conn, run.card_id)? == Category::InProgress;
+                        if in_progress {
+                            store::move_to_category(conn, run.card_id, Category::InReview)?;
+                        }
                         let branch = run.branch.as_deref().unwrap_or("?");
+                        let left_alone = if in_progress {
+                            ""
+                        } else {
+                            " La carte n'a pas été déplacée : elle n'est plus dans « En cours »."
+                        };
                         comment(
                             conn,
                             run.card_id,
-                            format!("Exécution {id} réussie : la branche `{branch}` est poussée sur origin."),
+                            format!("Exécution {id} réussie : la branche `{branch}` est poussée sur origin.{left_alone}"),
                         )
                     }
                     Outcome::Failed(why) => comment(
@@ -1052,6 +1061,18 @@ mod tests {
                 },
             );
             Arc::new(supervisor).run()
+        }
+
+        /// Waits for a file the fake agent writes beside its worktree once it has started.
+        async fn wait_for_file(&self, name: &str) {
+            let path = self.remote.worktrees.join(name);
+            for _ in 0..200 {
+                if path.exists() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("{name} never appeared");
         }
 
         /// The pid the `group_child` and `session_child` agents write beside their worktree.
@@ -1376,6 +1397,30 @@ mod tests {
         assert_eq!(h.column_category(card).await, Category::InProgress);
         assert!(h.comments(card).await[0].contains("limite de 1 s"));
         wait_until_gone(child).await;
+    }
+
+    #[tokio::test]
+    async fn a_card_a_human_moved_while_the_run_was_going_stays_where_they_put_it() {
+        let h = Harness::new("sup-moved");
+        let card = h.card("wait_then_success", "").await;
+        h.wait_for(card, |r| r.status == RunStatus::Running).await;
+        h.wait_for_file("HELM-1.args").await;
+        assert_eq!(h.column_category(card).await, Category::InProgress);
+
+        let done_column = 5;
+        h.db.call(move |conn| store::move_card(conn, card, done_column, 0))
+            .await
+            .unwrap();
+        std::fs::write(h.remote.worktrees.join("HELM-1.go"), "").unwrap();
+        let run = h.settled(card).await;
+
+        assert_eq!(run.status, RunStatus::Succeeded, "{:?}", run.error);
+        assert_eq!(h.column_category(card).await, Category::Done);
+        let comments = h.comments(card).await;
+        assert!(
+            comments[0].contains("réussie") && comments[0].contains("pas été déplacée"),
+            "{comments:?}"
+        );
     }
 
     #[tokio::test]
