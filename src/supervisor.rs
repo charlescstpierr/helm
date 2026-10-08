@@ -12,15 +12,16 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rusqlite::Connection;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Notify, Semaphore};
 
-use crate::adapter::{AgentAdapter, Finish, Launch, ParsedLine, Verdict};
+use crate::adapter::{self, AgentAdapter, Finish, Launch, ParsedLine, Verdict};
 use crate::agent::{Agent, ModelName, PermissionMode};
 use crate::changes::Changes;
 use crate::config::RunGate;
@@ -33,6 +34,8 @@ use crate::store::{self, Author, Category, StoreError};
 /// How often a busy run tells the open browsers it has news.
 const PUBLISH_EVERY: Duration = Duration::from_millis(250);
 const TERMINATE_GRACE: Duration = Duration::from_secs(3);
+const MAX_LINE_BYTES: usize = 1024 * 1024;
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
 const STDERR_DRAIN: Duration = Duration::from_secs(2);
 const STDERR_KEPT_BYTES: usize = 256 * 1024;
 
@@ -49,6 +52,7 @@ struct Shared {
     wake: Notify,
     /// One handle per running run, inserted when the run is claimed and removed when it ends.
     cancels: Mutex<HashMap<RunId, Arc<Notify>>>,
+    stopping: AtomicBool,
 }
 
 /// The HTTP side: queues and cancels. Cheap to clone.
@@ -65,6 +69,7 @@ impl Orchestrator {
                 claude,
                 wake: Notify::new(),
                 cancels: Mutex::new(HashMap::new()),
+                stopping: AtomicBool::new(false),
             }),
         }
     }
@@ -159,6 +164,24 @@ impl Orchestrator {
         .await
     }
 
+    pub async fn shutdown(&self) {
+        {
+            let cancels = lock(&self.shared.cancels);
+            self.shared.stopping.store(true, Ordering::SeqCst);
+            for handle in cancels.values() {
+                handle.notify_one();
+            }
+        }
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_WAIT;
+        while !lock(&self.shared.cancels).is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    fn stopping(&self) -> bool {
+        self.shared.stopping.load(Ordering::SeqCst)
+    }
+
     fn cancel_handle(&self, id: RunId) -> Option<Arc<Notify>> {
         lock(&self.shared.cancels).get(&id).cloned()
     }
@@ -166,9 +189,17 @@ impl Orchestrator {
     /// Claims the oldest queued run and registers its cancel handle in the same step, so a
     /// cancel can never see a running run without one.
     fn claim_next(&self, conn: &mut Connection) -> Result<Option<Run>, StoreError> {
+        if self.stopping() {
+            return Ok(None);
+        }
         let run = runs::claim_next_queued(conn)?;
         if let Some(run) = &run {
-            lock(&self.shared.cancels).insert(run.id, Arc::new(Notify::new()));
+            let mut cancels = lock(&self.shared.cancels);
+            let handle = Arc::new(Notify::new());
+            if self.stopping() {
+                handle.notify_one();
+            }
+            cancels.insert(run.id, handle);
         }
         Ok(run)
     }
@@ -190,6 +221,14 @@ fn log_store_error(context: &str, error: &StoreError) {
     eprintln!("helm: {context}: {error}");
 }
 
+fn still_running_message(pid: i64) -> String {
+    format!(
+        "un groupe de processus {pid} existe encore et pourrait être l'agent d'une exécution précédente : Helm ne lance pas un second agent dans le même worktree. Vérifiez d'abord ce qu'il est (par exemple `pgrep -a -g {pid}`), car ce numéro a pu être réutilisé par un autre programme. Si c'est bien l'agent, arrêtez-le avec `kill -- -{pid}`, puis remettez la carte dans « À faire »."
+    )
+}
+
+const STOPPED_BY_SHUTDOWN: &str = "Helm s'est arrêté pendant l'exécution.";
+
 /// Marks every run left `running` by a previous Helm as `interrupted`. Nothing is relaunched:
 /// whether to try again is the human's call. Returns how many runs were interrupted.
 pub async fn recover(db: &Db, changes: &Changes) -> Result<usize, StoreError> {
@@ -197,11 +236,11 @@ pub async fn recover(db: &Db, changes: &Changes) -> Result<usize, StoreError> {
         .call(|conn| {
             let orphans = runs::running_runs(conn)?;
             for orphan in &orphans {
-                let still_alive = orphan.pid.is_some_and(process_exists);
+                let still_alive = orphan.pid.is_some_and(group_exists);
                 let reason = if still_alive {
                     "Helm s'est arrêté pendant l'exécution. Le processus de l'agent existe encore mais n'est plus supervisé."
                 } else {
-                    "Helm s'est arrêté pendant l'exécution."
+                    STOPPED_BY_SHUTDOWN
                 };
                 runs::finish(conn, orphan.id, &Outcome::Interrupted(reason.to_owned()))?;
                 comment(
@@ -219,12 +258,14 @@ pub async fn recover(db: &Db, changes: &Changes) -> Result<usize, StoreError> {
     Ok(count)
 }
 
-fn process_exists(pid: i64) -> bool {
-    let Ok(pid) = i32::try_from(pid) else {
+fn group_exists(pid: i64) -> bool {
+    // 0 and 1 would not name a group: `kill(-0)` and `kill(-1)` reach this process's group and
+    // every process.
+    let Some(pid) = i32::try_from(pid).ok().filter(|pid| *pid > 1) else {
         return false;
     };
-    // SAFETY: signal 0 only checks that the process exists and can be signalled.
-    let rc = unsafe { libc::kill(pid, 0) };
+    // SAFETY: signal 0 only checks that the group exists and can be signalled.
+    let rc = unsafe { libc::kill(-pid, 0) };
     rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
@@ -257,6 +298,61 @@ async fn unless_cancelled<T>(cancel: &Notify, future: impl Future<Output = T>) -
         biased;
         () = cancel.notified() => None,
         value = future => Some(value),
+    }
+}
+
+enum Ended {
+    Exited(Exit),
+    Cancelled,
+    TimedOut,
+}
+
+fn describe(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds >= 60 && seconds % 60 == 0 {
+        format!("{} min", seconds / 60)
+    } else {
+        format!("{seconds} s")
+    }
+}
+
+#[derive(Default)]
+struct Line {
+    kept: Vec<u8>,
+    dropped: usize,
+}
+
+impl Line {
+    fn is_empty(&self) -> bool {
+        self.kept.is_empty() && self.dropped == 0
+    }
+
+    fn clear(&mut self) {
+        self.kept.clear();
+        self.dropped = 0;
+    }
+}
+
+/// Cancel-safe: `line` holds the progress between calls.
+async fn read_line(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    line: &mut Line,
+    cap: usize,
+) -> std::io::Result<bool> {
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            return Ok(!line.is_empty());
+        }
+        let newline = chunk.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(chunk.len(), |at| at + 1);
+        let keep = take.min(cap.saturating_sub(line.kept.len()));
+        line.kept.extend_from_slice(&chunk[..keep]);
+        line.dropped += take - keep;
+        reader.consume(take);
+        if newline.is_some() {
+            return Ok(true);
+        }
     }
 }
 
@@ -309,6 +405,7 @@ pub struct SupervisorConfig {
     pub repo: PathBuf,
     pub worktree_root: PathBuf,
     pub max_concurrent: usize,
+    pub run_timeout: Duration,
 }
 
 /// The background task: claims queued runs, up to the concurrency limit, and drives them.
@@ -398,13 +495,25 @@ impl Supervisor {
         };
         self.changes.publish();
 
+        let earlier = self
+            .db
+            .call(move |conn| runs::possibly_orphaned_pid(conn, card_id, id))
+            .await;
+        match earlier {
+            Err(e) => return Outcome::Failed(format!("exécutions précédentes illisibles : {e}")),
+            Ok(Some(pid)) if group_exists(pid) => {
+                return self.fail(id, still_running_message(pid)).await;
+            }
+            Ok(_) => {}
+        }
+
         let prepared = unless_cancelled(
             cancel,
             git::prepare_worktree(&self.config.repo, &self.config.worktree_root, &key, number),
         )
         .await;
         let worktree = match prepared {
-            None => return Outcome::Cancelled,
+            None => return self.stopped(),
             Some(Err(e)) => return Outcome::Failed(format!("worktree impossible : {e}")),
             Some(Ok(worktree)) => worktree,
         };
@@ -444,17 +553,26 @@ impl Supervisor {
         let mut finish = None;
         let ended = self.stream(run, &mut child, &mut finish, cancel).await;
         let exit = match ended {
-            Some(exit) => exit,
-            None => {
+            Ended::Exited(exit) => exit,
+            Ended::TimedOut => {
                 terminate(&mut child, group.as_ref()).await;
                 self.record_stderr(id, None, stderr_task).await;
-                self.note(
-                    id,
-                    EventKind::Notice,
-                    "Annulée par l'utilisateur.".to_owned(),
-                )
-                .await;
-                return Outcome::Cancelled;
+                let why = format!(
+                    "l'agent a dépassé la limite de {} et a été arrêté.",
+                    describe(self.config.run_timeout)
+                );
+                return self.fail(id, why).await;
+            }
+            Ended::Cancelled => {
+                terminate(&mut child, group.as_ref()).await;
+                self.record_stderr(id, None, stderr_task).await;
+                let outcome = self.stopped();
+                let notice = match &outcome {
+                    Outcome::Interrupted(why) => why.clone(),
+                    _ => "Annulée par l'utilisateur.".to_owned(),
+                };
+                self.note(id, EventKind::Notice, notice).await;
+                return outcome;
             }
         };
         let stderr = self.record_stderr(id, exit.code, stderr_task).await;
@@ -500,36 +618,40 @@ impl Supervisor {
     }
 
     /// Reads the agent's stdout to its end, storing each line, then waits for the exit.
-    /// `None` means the run was cancelled meanwhile.
     async fn stream(
         &self,
         run: &Run,
         child: &mut Child,
         finish: &mut Option<Finish>,
         cancel: &Notify,
-    ) -> Option<Exit> {
+    ) -> Ended {
         let id = run.id;
         let Some(stdout) = child.stdout.take() else {
-            return Some(Exit {
+            return Ended::Exited(Exit {
                 code: None,
                 signal: None,
             });
         };
         let reading = async {
             let mut reader = BufReader::new(stdout);
-            let mut line = Vec::new();
+            let mut line = Line::default();
             let mut session_recorded = false;
             let mut unpublished = false;
             let mut tick = tokio::time::interval(PUBLISH_EVERY);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
-                    read = reader.read_until(b'\n', &mut line) => match read {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            let text = String::from_utf8_lossy(&line).into_owned();
+                    read = read_line(&mut reader, &mut line, MAX_LINE_BYTES) => match read {
+                        Ok(false) => break,
+                        Ok(true) => {
+                            let text = String::from_utf8_lossy(&line.kept).into_owned();
+                            let parsed = if line.dropped > 0 {
+                                Some(adapter::truncated(&text, line.kept.len() + line.dropped))
+                            } else {
+                                self.adapter.parse_line(&text)
+                            };
                             line.clear();
-                            if let Some(parsed) = self.adapter.parse_line(&text) {
+                            if let Some(parsed) = parsed {
                                 self.store_line(id, parsed, &mut session_recorded, finish).await;
                                 unpublished = true;
                             }
@@ -547,17 +669,21 @@ impl Supervisor {
             }
             child.wait().await
         };
-        let status = unless_cancelled(cancel, reading).await?;
-        match status {
-            Ok(status) => Some(status.into()),
-            Err(e) => {
+        let limited = tokio::time::timeout(self.config.run_timeout, reading);
+        let Some(timed) = unless_cancelled(cancel, limited).await else {
+            return Ended::Cancelled;
+        };
+        match timed {
+            Err(_) => Ended::TimedOut,
+            Ok(Ok(status)) => Ended::Exited(status.into()),
+            Ok(Err(e)) => {
                 self.note(
                     id,
                     EventKind::Error,
                     format!("attente du processus impossible : {e}"),
                 )
                 .await;
-                Some(Exit {
+                Ended::Exited(Exit {
                     code: None,
                     signal: None,
                 })
@@ -629,39 +755,47 @@ impl Supervisor {
         stderr
     }
 
-    /// After a clean agent run: the work must be committed, then it is pushed.
     async fn publish_branch(
         &self,
         id: RunId,
         worktree: &git::Worktree,
         cancel: &Notify,
     ) -> Outcome {
-        let ahead = git::commits_ahead(&self.config.repo, &worktree.path).await;
-        match ahead {
-            Err(e) => {
+        let branch = &worktree.branch;
+        let pending = unless_cancelled(cancel, git::unpublished(&self.config.repo, worktree)).await;
+        match pending {
+            None => return self.stopped(),
+            Some(Err(e)) => {
                 return self
                     .fail(
                         id,
-                        format!("les commits de la branche sont illisibles : {e}"),
+                        format!("la branche {branch} ne peut pas être comparée à origin : {e}"),
                     )
                     .await;
             }
-            Ok(0) => {
+            Some(Ok(git::Unpublished::Nothing)) => {
+                return self
+                    .fail(
+                        id,
+                        format!("rien à pousser : origin a déjà tous les commits de {branch}."),
+                    )
+                    .await;
+            }
+            Some(Ok(git::Unpublished::Diverged)) => {
                 return self
                     .fail(
                         id,
                         format!(
-                            "l'agent a terminé sans rien commiter sur {} : rien à pousser.",
-                            worktree.branch
+                            "origin a sur {branch} des commits que le worktree n'a pas (historique réécrit ou travail poussé d'ailleurs) : Helm ne force jamais le push. Réconciliez la branche à la main, puis relancez."
                         ),
                     )
                     .await;
             }
-            Ok(count) => {
+            Some(Ok(git::Unpublished::Commits(count))) => {
                 self.note(
                     id,
                     EventKind::Notice,
-                    format!("{count} commit(s) à pousser sur {}.", worktree.branch),
+                    format!("{count} commit(s) à pousser sur {branch}."),
                 )
                 .await;
             }
@@ -684,7 +818,7 @@ impl Supervisor {
         )
         .await;
         match unless_cancelled(cancel, git::push(&worktree.path, &worktree.branch)).await {
-            None => Outcome::Cancelled,
+            None => self.stopped(),
             Some(Err(e)) => self.fail(id, format!("git push a échoué : {e}")).await,
             Some(Ok(())) => {
                 self.note(
@@ -695,6 +829,14 @@ impl Supervisor {
                 .await;
                 Outcome::Succeeded
             }
+        }
+    }
+
+    fn stopped(&self) -> Outcome {
+        if self.orchestrator.stopping() {
+            Outcome::Interrupted(STOPPED_BY_SHUTDOWN.to_owned())
+        } else {
+            Outcome::Cancelled
         }
     }
 
@@ -728,18 +870,32 @@ impl Supervisor {
                 let run = runs::get_run(conn, id)?;
                 match &outcome {
                     Outcome::Succeeded => {
-                        store::move_to_category(conn, run.card_id, Category::InReview)?;
+                        let in_progress =
+                            store::card_category(conn, run.card_id)? == Category::InProgress;
+                        if in_progress {
+                            store::move_to_category(conn, run.card_id, Category::InReview)?;
+                        }
                         let branch = run.branch.as_deref().unwrap_or("?");
+                        let left_alone = if in_progress {
+                            ""
+                        } else {
+                            " La carte n'a pas été déplacée : elle n'est plus dans « En cours »."
+                        };
                         comment(
                             conn,
                             run.card_id,
-                            format!("Exécution {id} réussie : la branche `{branch}` est poussée sur origin."),
+                            format!("Exécution {id} réussie : la branche `{branch}` est poussée sur origin.{left_alone}"),
                         )
                     }
-                    Outcome::Failed(why) | Outcome::Interrupted(why) => comment(
+                    Outcome::Failed(why) => comment(
                         conn,
                         run.card_id,
                         format!("Exécution {id} échouée : {why}"),
+                    ),
+                    Outcome::Interrupted(why) => comment(
+                        conn,
+                        run.card_id,
+                        format!("Exécution {id} interrompue : {why}"),
                     ),
                     Outcome::Cancelled => {
                         comment(conn, run.card_id, format!("Exécution {id} annulée."))
@@ -798,12 +954,19 @@ mod tests {
 
     const FAKE_CLAUDE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake-claude.sh");
 
+    #[derive(Clone, Copy)]
+    struct Limits {
+        max_concurrent: usize,
+        run_timeout: Duration,
+    }
+
     /// A board with one project repo, a bare origin, and a supervisor driving the fake agent.
     struct Harness {
         remote: Remote,
         db: Db,
         orchestrator: Orchestrator,
         changes: Changes,
+        limits: Limits,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -813,6 +976,26 @@ mod tests {
         }
 
         fn with_limit(name: &str, max_concurrent: usize) -> Self {
+            Self::build(
+                name,
+                Limits {
+                    max_concurrent,
+                    run_timeout: Duration::from_secs(60),
+                },
+            )
+        }
+
+        fn with_timeout(name: &str, run_timeout: Duration) -> Self {
+            Self::build(
+                name,
+                Limits {
+                    max_concurrent: 2,
+                    run_timeout,
+                },
+            )
+        }
+
+        fn build(name: &str, limits: Limits) -> Self {
             let remote = Remote::new(name);
             let db = Db::open_in_memory().unwrap();
             let orchestrator = Orchestrator::new(
@@ -823,6 +1006,30 @@ mod tests {
                 },
             );
             let changes = Changes::new();
+            let task = tokio::spawn(Self::supervisor(
+                &remote,
+                &db,
+                &orchestrator,
+                &changes,
+                limits,
+            ));
+            Self {
+                remote,
+                db,
+                orchestrator,
+                changes,
+                limits,
+                task,
+            }
+        }
+
+        fn supervisor(
+            remote: &Remote,
+            db: &Db,
+            orchestrator: &Orchestrator,
+            changes: &Changes,
+            limits: Limits,
+        ) -> impl Future<Output = ()> + use<> {
             let supervisor = Supervisor::new(
                 db.clone(),
                 orchestrator.clone(),
@@ -833,17 +1040,59 @@ mod tests {
                 SupervisorConfig {
                     repo: remote.repo.clone(),
                     worktree_root: remote.worktrees.clone(),
-                    max_concurrent,
+                    max_concurrent: limits.max_concurrent,
+                    run_timeout: limits.run_timeout,
                 },
             );
-            let task = tokio::spawn(Arc::new(supervisor).run());
-            Self {
-                remote,
-                db,
-                orchestrator,
-                changes,
-                task,
+            Arc::new(supervisor).run()
+        }
+
+        async fn wait_for_file(&self, name: &str) {
+            let path = self.remote.worktrees.join(name);
+            for _ in 0..200 {
+                if path.exists() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
+            panic!("{name} never appeared");
+        }
+
+        async fn child_pid(&self, worktree: &str) -> i64 {
+            let marker = self.remote.worktrees.join(format!("{worktree}.child"));
+            for _ in 0..200 {
+                let pid = std::fs::read_to_string(&marker)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<i64>().ok());
+                if let Some(pid) = pid {
+                    return pid;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("the agent never started a child");
+        }
+
+        async fn requeue(&self, card: i64) {
+            let orchestrator = self.orchestrator.clone();
+            self.db
+                .call(move |conn| {
+                    store::move_card(conn, card, 1, 0)?;
+                    let entered = store::move_card(conn, card, 2, 0)?;
+                    orchestrator.after_placement(conn, card, entered)
+                })
+                .await
+                .unwrap();
+        }
+
+        fn restart(&mut self) {
+            self.task.abort();
+            self.task = tokio::spawn(Self::supervisor(
+                &self.remote,
+                &self.db,
+                &self.orchestrator,
+                &self.changes,
+                self.limits,
+            ));
         }
 
         /// A card with the agent assigned, created straight in `À faire` so a run is queued.
@@ -1078,6 +1327,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_oversized_output_line_is_truncated_and_recorded_without_failing_the_run() {
+        let h = Harness::new("sup-long-line");
+        let card = h.card("long_line", "").await;
+
+        let run = h.settled(card).await;
+
+        assert_eq!(run.status, RunStatus::Succeeded, "{:?}", run.error);
+        let events = h.events(run.id).await;
+        let truncated: Vec<&String> = events
+            .iter()
+            .filter(|(kind, summary)| *kind == EventKind::Malformed && summary.contains("tronquée"))
+            .map(|(_, summary)| summary)
+            .collect();
+        assert_eq!(truncated.len(), 1, "{events:?}");
+        assert!(truncated[0].contains("3000001"), "{}", truncated[0]);
+        let largest: i64 =
+            h.db.call(move |conn| {
+                conn.query_row(
+                    "SELECT MAX(length(payload)) FROM agent_events WHERE run_id = ?1",
+                    [run.id],
+                    |row| row.get(0),
+                )
+                .map_err(StoreError::from)
+            })
+            .await
+            .unwrap();
+        assert!(largest <= MAX_LINE_BYTES as i64 + 4096, "{largest}");
+        assert!(
+            events.iter().any(|(kind, _)| *kind == EventKind::Result),
+            "the lines after the long one are still read"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_still_going_after_the_time_limit_is_stopped_and_fails_with_the_reason() {
+        let h = Harness::with_timeout("sup-timeout", Duration::from_secs(1));
+        let card = h.card("group_child", "").await;
+        let running = h.wait_for(card, |r| r.status == RunStatus::Running).await;
+        let child = h.child_pid("HELM-1").await;
+
+        let run = h.wait_for(card, |r| !r.status.is_active()).await;
+
+        assert_eq!(run.status, RunStatus::Failed, "{:?}", run.error);
+        assert_eq!(run.id, running.id);
+        let error = run.error.as_deref().unwrap();
+        assert!(error.contains("limite de 1 s"), "{error}");
+        assert!(run.pushed_at.is_none());
+        assert_eq!(h.column_category(card).await, Category::InProgress);
+        assert!(h.comments(card).await[0].contains("limite de 1 s"));
+        wait_until_gone(child).await;
+    }
+
+    #[tokio::test]
+    async fn a_card_a_human_moved_while_the_run_was_going_stays_where_they_put_it() {
+        let h = Harness::new("sup-moved");
+        let card = h.card("wait_then_success", "").await;
+        h.wait_for(card, |r| r.status == RunStatus::Running).await;
+        h.wait_for_file("HELM-1.args").await;
+        assert_eq!(h.column_category(card).await, Category::InProgress);
+
+        let done_column = 5;
+        h.db.call(move |conn| store::move_card(conn, card, done_column, 0))
+            .await
+            .unwrap();
+        std::fs::write(h.remote.worktrees.join("HELM-1.go"), "").unwrap();
+        let run = h.settled(card).await;
+
+        assert_eq!(run.status, RunStatus::Succeeded, "{:?}", run.error);
+        assert_eq!(h.column_category(card).await, Category::Done);
+        let comments = h.comments(card).await;
+        assert!(
+            comments[0].contains("réussie") && comments[0].contains("pas été déplacée"),
+            "{comments:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_failed_push_fails_the_run_instead_of_reporting_success() {
         let h = Harness::new("sup-push-fail");
         git_run(
@@ -1090,14 +1416,17 @@ mod tests {
 
         assert_eq!(run.status, RunStatus::Failed);
         assert!(
-            run.error.as_deref().unwrap().contains("git push a échoué"),
+            run.error
+                .as_deref()
+                .unwrap()
+                .contains("ne peut pas être comparée à origin"),
             "{:?}",
             run.error
         );
         assert!(run.pushed_at.is_none());
         assert_eq!(run.exit_code, Some(0), "the agent itself succeeded");
         assert_eq!(h.column_category(card).await, Category::InProgress);
-        assert!(h.comments(card).await[0].contains("git push a échoué"));
+        assert!(h.comments(card).await[0].contains("origin"));
         // The commit is still in the worktree for a human to deal with.
         assert!(h.remote.worktrees.join("HELM-1/HELLO.md").exists());
     }
@@ -1109,7 +1438,7 @@ mod tests {
         let run = h.settled(card).await;
         assert_eq!(run.status, RunStatus::Failed);
         assert!(
-            run.error.as_deref().unwrap().contains("rien commiter"),
+            run.error.as_deref().unwrap().contains("rien à pousser"),
             "{:?}",
             run.error
         );
@@ -1137,6 +1466,93 @@ mod tests {
             pushed.contains("HELLO.md") && !pushed.contains("LEFTOVER.md"),
             "{pushed}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_rerun_that_adds_nothing_fails_when_origin_already_has_the_branch_tip() {
+        let h = Harness::new("sup-rerun");
+        let card = h.card("success", "").await;
+        let first = h.settled(card).await;
+        assert_eq!(first.status, RunStatus::Succeeded, "{:?}", first.error);
+
+        let orchestrator = h.orchestrator.clone();
+        h.db.call(move |conn| {
+            let entered = store::move_card(conn, card, 2, 0)?;
+            orchestrator.after_placement(conn, card, entered)
+        })
+        .await
+        .unwrap();
+        let second = h
+            .wait_for(card, |run| run.id != first.id && !run.status.is_active())
+            .await;
+
+        assert_eq!(second.status, RunStatus::Failed, "{:?}", second.error);
+        assert!(
+            second.error.as_deref().unwrap().contains("rien à pousser"),
+            "{:?}",
+            second.error
+        );
+        assert!(second.pushed_at.is_none());
+        assert_eq!(h.column_category(card).await, Category::InProgress);
+    }
+
+    #[tokio::test]
+    async fn a_rerun_publishes_commits_an_earlier_run_made_but_could_not_push() {
+        let h = Harness::new("sup-retry-push");
+        let origin = h.remote.origin.to_str().unwrap().to_owned();
+        git_run(
+            &h.remote.repo,
+            &["remote", "set-url", "origin", "/nonexistent/origin.git"],
+        );
+        let card = h.card("success", "").await;
+        let first = h.settled(card).await;
+        assert_eq!(first.status, RunStatus::Failed, "{:?}", first.error);
+        assert!(h.remote.worktrees.join("HELM-1/HELLO.md").exists());
+
+        git_run(&h.remote.repo, &["remote", "set-url", "origin", &origin]);
+        h.requeue(card).await;
+        let second = h
+            .wait_for(card, |run| run.id != first.id && !run.status.is_active())
+            .await;
+
+        assert_eq!(second.status, RunStatus::Succeeded, "{:?}", second.error);
+        assert!(second.pushed_at.is_some());
+        let landed = git_run(
+            &h.remote.origin,
+            &["log", "-1", "--format=%s", "helm/HELM-1"],
+        );
+        assert_eq!(landed, "Add HELLO.md");
+        assert_eq!(h.column_category(card).await, Category::InReview);
+    }
+
+    #[tokio::test]
+    async fn a_rerun_after_pushed_history_was_rewritten_fails_and_never_forces() {
+        let h = Harness::new("sup-diverged");
+        let card = h.card("success", "").await;
+        let first = h.settled(card).await;
+        assert_eq!(first.status, RunStatus::Succeeded, "{:?}", first.error);
+        let pushed = git_run(&h.remote.origin, &["rev-parse", "helm/HELM-1"]);
+
+        let worktree = h.remote.worktrees.join("HELM-1");
+        git_run(&worktree, &["commit", "-q", "--amend", "-m", "Rewritten"]);
+        h.requeue(card).await;
+        let second = h
+            .wait_for(card, |run| run.id != first.id && !run.status.is_active())
+            .await;
+
+        assert_eq!(second.status, RunStatus::Failed, "{:?}", second.error);
+        assert!(
+            second.error.as_deref().unwrap().contains("ne force jamais"),
+            "{:?}",
+            second.error
+        );
+        assert!(second.pushed_at.is_none());
+        assert_eq!(
+            git_run(&h.remote.origin, &["rev-parse", "helm/HELM-1"]),
+            pushed,
+            "origin's branch is untouched"
+        );
+        assert_eq!(h.column_category(card).await, Category::InProgress);
     }
 
     #[tokio::test]
@@ -1181,6 +1597,73 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    fn process_exists(pid: i64) -> bool {
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: signal 0 only checks that the process exists and can be signalled.
+        let rc = unsafe { libc::kill(pid, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    enum Stop {
+        Cancel,
+        Shutdown,
+    }
+
+    fn gone(pid: i64) -> bool {
+        !process_exists(pid) || is_zombie(pid)
+    }
+
+    async fn wait_until_gone(pid: i64) {
+        for _ in 0..200 {
+            if gone(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("process {pid} outlived its run");
+    }
+
+    async fn assert_stop_reaps_the_agents_children(name: &str, scenario: &str, stop: Stop) {
+        let h = Harness::new(name);
+        let card = h.card(scenario, "").await;
+        let running = h.wait_for(card, |r| r.status == RunStatus::Running).await;
+        let child = h.child_pid("HELM-1").await;
+        assert!(!gone(child), "the child runs before the stop");
+
+        match stop {
+            Stop::Cancel => {
+                h.orchestrator.cancel(&h.db, running.id).await.unwrap();
+            }
+            Stop::Shutdown => h.orchestrator.shutdown().await,
+        }
+        let run = h.settled(card).await;
+
+        let expected = match stop {
+            Stop::Cancel => RunStatus::Cancelled,
+            Stop::Shutdown => RunStatus::Interrupted,
+        };
+        assert_eq!(run.status, expected, "{scenario}: {:?}", run.error);
+        wait_until_gone(child).await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_run_stops_the_agents_children_too() {
+        assert_stop_reaps_the_agents_children("sup-cancel-group", "group_child", Stop::Cancel)
+            .await;
+        assert_stop_reaps_the_agents_children("sup-cancel-session", "session_child", Stop::Cancel)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn shutting_down_stops_the_agents_children_too_and_interrupts_the_run() {
+        assert_stop_reaps_the_agents_children("sup-stop-group", "group_child", Stop::Shutdown)
+            .await;
+        assert_stop_reaps_the_agents_children("sup-stop-session", "session_child", Stop::Shutdown)
+            .await;
     }
 
     fn is_zombie(pid: i64) -> bool {
@@ -1312,7 +1795,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_run_left_running_by_a_dead_helm_becomes_interrupted_and_is_never_relaunched() {
-        let h = Harness::new("sup-recover");
+        let mut h = Harness::new("sup-recover");
         h.task.abort();
         let card = h.card("success", "").await;
         // Simulate the previous Helm: the run was claimed, its process is gone.
@@ -1336,24 +1819,158 @@ mod tests {
         assert_eq!(recover(&h.db, &h.changes).await.unwrap(), 0, "idempotent");
 
         // A fresh supervisor does not pick the interrupted run up again.
-        let supervisor = Supervisor::new(
-            h.db.clone(),
-            h.orchestrator.clone(),
-            Arc::new(ClaudeAdapter {
-                command: PathBuf::from(FAKE_CLAUDE),
-            }),
-            h.changes.clone(),
-            SupervisorConfig {
-                repo: h.remote.repo.clone(),
-                worktree_root: h.remote.worktrees.clone(),
-                max_concurrent: 1,
-            },
-        );
-        let task = tokio::spawn(Arc::new(supervisor).run());
+        h.restart();
         tokio::time::sleep(Duration::from_millis(300)).await;
-        task.abort();
         assert_eq!(h.latest(card).await.status, RunStatus::Interrupted);
         assert!(!h.remote.worktrees.join("HELM-1").exists());
+    }
+
+    #[tokio::test]
+    async fn a_new_run_is_refused_while_the_previous_agent_still_lives_in_the_worktree() {
+        let mut h = Harness::new("sup-orphan");
+        h.task.abort();
+        let card = h.card("success", "").await;
+        use std::os::unix::process::CommandExt;
+        let mut orphan = std::process::Command::new("sleep")
+            .arg("301")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let orphan_id = orphan.id();
+        let orphan_pid = i64::from(orphan_id);
+        h.db.call(move |conn| {
+            let run = runs::claim_next_queued(conn)?.unwrap();
+            runs::record_pid(conn, run.id, orphan_id)?;
+            Ok::<_, StoreError>(())
+        })
+        .await
+        .unwrap();
+        recover(&h.db, &h.changes).await.unwrap();
+        h.restart();
+
+        let interrupted = h.latest(card).await;
+        assert_eq!(interrupted.status, RunStatus::Interrupted);
+        h.requeue(card).await;
+        let refused = h
+            .wait_for(card, |r| r.id > interrupted.id && !r.status.is_active())
+            .await;
+        assert_eq!(refused.status, RunStatus::Failed, "{:?}", refused.error);
+
+        let error = refused.error.as_deref().unwrap();
+        assert!(
+            error.contains(&format!("kill -- -{orphan_pid}")),
+            "the card says how to stop the old agent: {error}"
+        );
+        assert!(refused.pid.is_none(), "no second agent was launched");
+        assert!(!h.remote.worktrees.join("HELM-1").exists());
+        assert!(
+            group_exists(orphan_pid),
+            "Helm does not kill a process it cannot identify"
+        );
+
+        assert!(
+            error.contains(&format!("pgrep -a -g {orphan_pid}")),
+            "the card says to check what the process is first: {error}"
+        );
+
+        // The refusal is itself the latest run, and it must not lift the block.
+        h.requeue(card).await;
+        let refused_again = h
+            .wait_for(card, |r| r.id > refused.id && !r.status.is_active())
+            .await;
+        assert_eq!(
+            refused_again.status,
+            RunStatus::Failed,
+            "{:?}",
+            refused_again.error
+        );
+        assert!(refused_again.pid.is_none());
+
+        orphan.kill().unwrap();
+        orphan.wait().unwrap();
+        h.requeue(card).await;
+        let run = h
+            .wait_for(card, |r| r.id > refused_again.id && !r.status.is_active())
+            .await;
+        assert_eq!(run.status, RunStatus::Succeeded, "{:?}", run.error);
+    }
+
+    #[tokio::test]
+    async fn a_pid_from_before_a_later_run_that_launched_an_agent_no_longer_blocks_the_card() {
+        let mut h = Harness::new("sup-stale-pid");
+        h.task.abort();
+        let card = h.card("success", "").await;
+        let interrupted =
+            h.db.call(|conn| {
+                let run = runs::claim_next_queued(conn)?.unwrap();
+                runs::record_pid(conn, run.id, 2_000_000_000)?;
+                Ok::<_, StoreError>(run.id)
+            })
+            .await
+            .unwrap();
+        recover(&h.db, &h.changes).await.unwrap();
+        h.restart();
+        h.requeue(card).await;
+        let later = h
+            .wait_for(card, |r| r.id > interrupted && !r.status.is_active())
+            .await;
+        assert_eq!(later.status, RunStatus::Succeeded, "{:?}", later.error);
+        assert!(later.pid.is_some(), "the later run launched an agent");
+
+        // Long afterwards the old pid names an unrelated, live process group.
+        use std::os::unix::process::CommandExt;
+        let mut stranger = std::process::Command::new("sleep")
+            .arg("302")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let stranger_pid = stranger.id();
+        h.db.call(move |conn| {
+            conn.execute(
+                "UPDATE agent_runs SET pid = ?2 WHERE id = ?1",
+                (interrupted, i64::from(stranger_pid)),
+            )?;
+            Ok::<_, StoreError>(())
+        })
+        .await
+        .unwrap();
+        h.requeue(card).await;
+        let run = h
+            .wait_for(card, |r| r.id > later.id && !r.status.is_active())
+            .await;
+        stranger.kill().unwrap();
+        stranger.wait().unwrap();
+
+        let reason = run.error.as_deref().unwrap_or_default();
+        assert!(
+            !reason.contains(&format!("-{stranger_pid}")),
+            "an old interrupted run no longer blocks: {reason}"
+        );
+        assert!(run.pid.is_some(), "the agent was launched: {reason}");
+    }
+
+    #[tokio::test]
+    async fn a_line_longer_than_the_cap_is_counted_but_only_its_start_is_kept() {
+        let long = 50_000_000;
+        let stream = tokio::io::repeat(b'x')
+            .take(long)
+            .chain(&b"\nnext\nlast"[..]);
+        let mut reader = BufReader::new(stream);
+        let mut line = Line::default();
+
+        assert!(read_line(&mut reader, &mut line, 1024).await.unwrap());
+        assert_eq!(
+            (line.kept.len(), line.dropped),
+            (1024, long as usize + 1 - 1024)
+        );
+        line.clear();
+        assert!(read_line(&mut reader, &mut line, 1024).await.unwrap());
+        assert_eq!((line.kept.as_slice(), line.dropped), (&b"next\n"[..], 0));
+        line.clear();
+        assert!(read_line(&mut reader, &mut line, 1024).await.unwrap());
+        assert_eq!(line.kept, b"last");
+        line.clear();
+        assert!(!read_line(&mut reader, &mut line, 1024).await.unwrap());
     }
 
     #[test]
@@ -1390,8 +2007,9 @@ mod tests {
 
     #[test]
     fn a_dead_pid_is_not_a_live_process() {
-        assert!(process_exists(i64::from(std::process::id())));
-        assert!(!process_exists(2_000_000_000));
-        assert!(!process_exists(i64::MAX));
+        assert!(!group_exists(2_000_000_000));
+        assert!(!group_exists(i64::MAX));
+        assert!(!group_exists(0));
+        assert!(!group_exists(-1));
     }
 }

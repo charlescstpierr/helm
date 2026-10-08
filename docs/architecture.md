@@ -264,7 +264,8 @@ codex exec --json "<consigne>"                          # prévu ; reprise : cod
   JSON par ligne), normalisée par un adaptateur propre à chaque CLI, puis insérée dans
   `agent_events`. Chaque insertion publie un événement SSE : la carte affiche l'activité en
   direct, et l'historique complet reste consultable après coup. La sortie d'erreur est
-  conservée à part pour le diagnostic (`agent_runs.stderr`, 256 Kio au plus). Les nouvelles
+  conservée à part pour le diagnostic (`agent_runs.stderr`, 256 Kio au plus). Une ligne de plus
+  de 1 Mio est tronquée à la lecture et signalée dans le journal, sans interrompre l'exécution. Les nouvelles
   lignes sont annoncées aux navigateurs au plus quatre fois par seconde par exécution.
 - **Reprise par identifiant de session.** Le `session_id` émis par le CLI est enregistré dès
   qu'il apparaît. Relancer après des retours de revue, un échec ou un redémarrage de Helm
@@ -272,15 +273,27 @@ codex exec --json "<consigne>"                          # prévu ; reprise : cod
   worktree : le contexte de l'agent est conservé, l'historique des tentatives aussi.
 - **Supervision.** Les processus sont lancés avec `tokio::process` et attendus de façon
   asynchrone ; une limite de concurrence configurable borne le nombre d'agents simultanés.
+  Un arrêt normal de Helm (SIGINT, SIGTERM) arrête chaque agent comme une annulation (SIGTERM au
+  groupe, puis SIGKILL après 3 s) et marque l'exécution `interrupted`. Un agent encore actif
+  après `agents.run_timeout_minutes` est arrêté de la même façon et l'exécution échoue.
   Au démarrage, toute exécution encore `running` en base passe à `interrupted` — jamais
   relancée en silence ; si son processus existe encore, l'erreur le dit (Helm ne peut plus le
-  superviser et ne tue pas un pid qu'il ne peut pas identifier). Une seule exécution active par
+  superviser et ne tue pas un pid qu'il ne peut pas identifier). Pour la même raison, une
+  nouvelle exécution est refusée tant que le groupe de processus de la dernière exécution de la
+  carte ayant lancé un agent existe encore, si celle-ci a été interrompue (une exécution plus
+  récente qui a lancé un agent a passé ce contrôle : les pid plus anciens ne comptent plus, un
+  autre programme a pu les réutiliser). Le message dit de vérifier ce qu'est ce processus avant de
+  l'arrêter, puis donne la commande. Une seule exécution active par
   carte (index unique partiel).
-- **Fin de travail : pousser la branche.** Après un succès de l'agent, Helm vérifie que la
-  branche porte au moins un commit de plus que la branche par défaut (sinon l'exécution
-  échoue : « rien à pousser »), puis exécute `git push --set-upstream origin helm/<clé>-<n>`,
-  jamais forcé. Aucune PR n'est ouverte. Un push refusé ou impossible fait échouer l'exécution :
-  la base refuse un `succeeded` sans `pushed_at`. Les modifications non commitées laissées par
+- **Fin de travail : pousser la branche.** Après un succès de l'agent, Helm demande à
+  `origin` où en est la branche (`git ls-remote`, jamais la copie locale `origin/<branche>`, qui peut
+  être périmée) et la compare au worktree. Si la branche porte des commits que `origin` n'a pas,
+  qu'ils viennent de cette exécution ou d'une précédente restée sans push, Helm exécute
+  `git push --set-upstream origin helm/<clé>-<n>`, jamais forcé. Si `origin` a déjà tout (ou n'a pas
+  la branche et que le worktree n'ajoute rien à la branche par défaut), l'exécution échoue : « rien à
+  pousser ». Si `origin` a des commits que le worktree n'a pas (historique réécrit, travail poussé
+  d'ailleurs), elle échoue aussi, sans push. `origin` injoignable : elle échoue. Aucune PR n'est ouverte. Un
+  push refusé ou impossible fait échouer l'exécution : la base refuse un `succeeded` sans `pushed_at`. Les modifications non commitées laissées par
   l'agent restent dans le worktree et sont signalées dans le journal.
 
 Un trait `AgentAdapter` isole ce qui diffère entre CLI : construire la commande (lancement et

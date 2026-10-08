@@ -12,11 +12,12 @@ db_path = "helm.db"
 # Runs also need a loopback `bind`: Helm has no authentication, and a run executes code.
 #
 # [project]
-# repo = "~/code/my-project"                          # git repository cards are worked on in
+# repo = "~/code/my-project"                          # git repository cards are worked on in; absolute or ~/…
 # worktree_root = "~/.local/share/helm/worktrees"     # one worktree per card: <root>/<KEY>-<n>
 #
 # [agents]
 # max_concurrent = 2                                  # runs in flight at once
+# run_timeout_minutes = 60                            # an agent still running after this is stopped; the run fails
 #
 # [agents.claude]
 # command = "claude"                                  # executable, looked up on PATH

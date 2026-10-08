@@ -33,9 +33,10 @@ Tout est optionnel. Ordre de priorité : variables d'environnement, puis fichier
 | --------------------- | --------------------- | ---------------- | ---------------------------------------------- |
 | `bind`                | `HELM_BIND`           | `127.0.0.1:7878` | Adresse d'écoute.                              |
 | `db_path`             | `HELM_DB`             | `helm.db`        | Fichier SQLite (mode WAL).                     |
-| `project.repo`        |                       | aucun            | Dépôt git des cartes. Sans lui, pas d'agents.  |
-| `project.worktree_root` |                     | `~/.local/share/helm/worktrees` | Un worktree par carte : `<racine>/<CLÉ>-<n>`. |
+| `project.repo`        |                       | aucun            | Dépôt git des cartes (chemin absolu ou `~/…`). Sans lui, pas d'agents. |
+| `project.worktree_root` |                     | `~/.local/share/helm/worktrees` | Un worktree par carte : `<racine>/<CLÉ>-<n>` (chemin absolu ou `~/…`). |
 | `agents.max_concurrent` |                     | `2`              | Exécutions simultanées au plus.                |
+| `agents.run_timeout_minutes` |                | `60`             | Durée maximale d'un agent ; au-delà il est arrêté et l'exécution échoue. |
 | `agents.claude.command` |                     | `claude`         | Exécutable de Claude Code.                     |
 | `agents.claude.permission_mode` |             | `bypassPermissions` | `--permission-mode` des exécutions.         |
 | `agents.claude.model` |                       | celui du CLI     | Modèle des cartes qui n'en nomment pas.        |
@@ -59,11 +60,20 @@ Dans le formulaire d'une carte, choisissez l'agent (Claude) et, si besoin, un mo
 de `agents.claude.model`, sinon celui du CLI). Quand la carte **entre** dans une colonne « À
 faire », une exécution est mise en file : Helm crée le worktree `<racine>/<CLÉ>-<n>` sur la
 branche `helm/<CLÉ>-<n>`, lance `claude -p` dedans (mode `bypassPermissions` par défaut), garde
-chaque événement du flux (affiché en direct dans « Activité de l'agent » : statut, branche, session, coût, jetons, journal, sortie d'erreur, consigne), puis pousse la branche vers `origin`. Succès : la carte
-passe en « En revue ». Échec (agent, absence de commit, push refusé) : elle reste « En cours » et
+chaque événement du flux (affiché en direct dans « Activité de l'agent » : statut, branche, session, coût, jetons, journal, sortie d'erreur, consigne), puis pousse vers `origin` les commits de la branche qu'`origin` n'a pas encore (ceux de cette exécution ou d'une précédente dont le push avait échoué). Succès : la carte
+passe en « En revue » si elle est encore « En cours » (déplacée à la main entre-temps, elle y reste). Échec (agent, rien de nouveau à pousser, `origin` injoignable ou divergent, push refusé) : elle reste « En cours » et
 l'erreur est affichée sur la carte et ajoutée à son fil. Aucune PR n'est ouverte et les worktrees ne sont pas nettoyés.
-Une exécution en cours peut être annulée depuis la carte ; si Helm s'arrête pendant une
-exécution, celle-ci est marquée « interrompue » au redémarrage et n'est jamais relancée seule.
+Une ligne de sortie de plus de 1 Mio est tronquée (son début est gardé, le journal le signale) sans
+interrompre l'exécution. Un agent encore actif après `agents.run_timeout_minutes` est arrêté comme
+par une annulation, et l'exécution échoue avec la limite pour motif.
+Une exécution en cours peut être annulée depuis la carte. Un arrêt normal de Helm (SIGINT, SIGTERM)
+arrête les agents de la même façon (SIGTERM au groupe de processus, puis SIGKILL après 3 s) et marque
+l'exécution « interrompue ». Si Helm est tué sans préavis, l'exécution est marquée « interrompue »
+au redémarrage ; elle n'est jamais relancée seule, et si son agent tourne encore, une nouvelle
+exécution sur la même carte est refusée tant que ce groupe de processus existe (seule la dernière
+exécution ayant lancé un agent compte). Le message dit de vérifier ce qu'est ce processus avant de
+l'arrêter (`kill -- -<pid>`), car Helm ne peut pas le distinguer d'un processus qui aurait reçu le
+même numéro.
 
 ## Architecture
 

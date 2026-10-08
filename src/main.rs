@@ -106,6 +106,7 @@ async fn serve(config: &Config, db: Db) -> Result<(), Box<dyn Error>> {
     if !config.bind.ip().is_loopback() {
         eprintln!("helm: warning: not bound to loopback and there is no authentication");
     }
+    let stopper = orchestrator.clone();
     let _supervisor = match (gate, &config.project) {
         (RunGate::Open, Some(project)) => {
             git::check_repository(&project.repo).await?;
@@ -126,6 +127,7 @@ async fn serve(config: &Config, db: Db) -> Result<(), Box<dyn Error>> {
                     repo: project.repo.clone(),
                     worktree_root: project.worktree_root.clone(),
                     max_concurrent: config.agents.max_concurrent,
+                    run_timeout: config.agents.run_timeout,
                 },
             );
             Some(tokio::spawn(Arc::new(supervisor).run()))
@@ -143,6 +145,7 @@ async fn serve(config: &Config, db: Db) -> Result<(), Box<dyn Error>> {
         result = axum::serve(listener, routes::router(state)) => result?,
         () = shutdown_signal() => eprintln!("helm: shutting down"),
     }
+    stopper.shutdown().await;
     Ok(())
 }
 

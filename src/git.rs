@@ -1,5 +1,6 @@
-//! The git operations a run needs: a worktree per card, a commit count, a push. Each shells
-//! out to `git`, so the user's own configuration (identity, credentials, hooks) applies.
+//! The git operations a run needs: a worktree per card, the branch's state on origin, a push.
+//! Each shells out to `git`, so the user's own configuration (identity, credentials, hooks)
+//! applies.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -8,7 +9,7 @@ use std::time::Duration;
 
 use tokio::process::Command;
 
-const PUSH_TIMEOUT: Duration = Duration::from_secs(120);
+const REMOTE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]
 pub struct GitError(String);
@@ -173,13 +174,72 @@ pub async fn prepare_worktree(
     Ok(Worktree { path, branch })
 }
 
-/// Commits on the worktree's branch that the default branch does not have.
-pub async fn commits_ahead(repo: &Path, worktree: &Path) -> Result<u64> {
-    let base = default_branch(repo).await?;
-    let count = git(worktree, &["rev-list", "--count", &format!("{base}..HEAD")]).await?;
-    count
-        .parse()
-        .map_err(|_| GitError(format!("unexpected commit count {count:?}")))
+/// What a push of the card's branch would put on origin.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Unpublished {
+    /// Origin already has everything the branch holds.
+    Nothing,
+    /// This many commits the branch holds and origin lacks. Never zero.
+    Commits(u64),
+    /// Origin has commits the branch lacks (rewritten history, or work pushed from elsewhere):
+    /// a push would be refused and Helm never forces.
+    Diverged,
+}
+
+/// Compares the worktree's branch with the branch as origin holds it right now, or with the
+/// default branch when origin has none yet. Asks origin through `ls-remote` rather than
+/// trusting `refs/remotes/origin/*`, which can be stale: the branch may have been deleted on
+/// the remote, or never fetched. Fails when origin cannot be reached.
+pub async fn unpublished(repo: &Path, worktree: &Worktree) -> Result<Unpublished> {
+    let dir = worktree.path.as_path();
+    let range = match remote_tip(dir, &worktree.branch).await? {
+        None => default_branch(repo).await?,
+        Some(tip) => {
+            let known = succeeds(dir, &["cat-file", "-e", &format!("{tip}^{{commit}}")]).await;
+            if !known {
+                return Ok(Unpublished::Diverged);
+            }
+            if succeeds(dir, &["merge-base", "--is-ancestor", "HEAD", &tip]).await {
+                return Ok(Unpublished::Nothing);
+            }
+            if !succeeds(dir, &["merge-base", "--is-ancestor", &tip, "HEAD"]).await {
+                return Ok(Unpublished::Diverged);
+            }
+            tip
+        }
+    };
+    let count = git(dir, &["rev-list", "--count", &format!("{range}..HEAD")]).await?;
+    match count.parse::<u64>() {
+        Ok(0) => Ok(Unpublished::Nothing),
+        Ok(n) => Ok(Unpublished::Commits(n)),
+        Err(_) => error(format!("unexpected commit count {count:?}")),
+    }
+}
+
+async fn remote_tip(dir: &Path, branch: &str) -> Result<Option<String>> {
+    let full = format!("refs/heads/{branch}");
+    let listing = with_remote_timeout(
+        "git ls-remote",
+        git(dir, &["ls-remote", "--heads", "origin", &full]),
+    )
+    .await?;
+    Ok(listing.lines().find_map(|line| {
+        let (sha, name) = line.split_once('\t')?;
+        (name == full).then(|| sha.to_owned())
+    }))
+}
+
+async fn with_remote_timeout(
+    what: &str,
+    run: impl std::future::Future<Output = Result<String>>,
+) -> Result<String> {
+    match tokio::time::timeout(REMOTE_TIMEOUT, run).await {
+        Ok(result) => result,
+        Err(_) => error(format!(
+            "{what} did not finish within {} seconds",
+            REMOTE_TIMEOUT.as_secs()
+        )),
+    }
 }
 
 pub async fn has_uncommitted_changes(worktree: &Path) -> Result<bool> {
@@ -189,13 +249,9 @@ pub async fn has_uncommitted_changes(worktree: &Path) -> Result<bool> {
 /// Pushes the branch to `origin`. Never forced: a rejected push is a failed run.
 pub async fn push(worktree: &Path, branch: &str) -> Result<()> {
     let args = ["push", "--set-upstream", "origin", branch];
-    match tokio::time::timeout(PUSH_TIMEOUT, git(worktree, &args)).await {
-        Ok(result) => result.map(drop),
-        Err(_) => error(format!(
-            "git push did not finish within {} seconds",
-            PUSH_TIMEOUT.as_secs()
-        )),
-    }
+    with_remote_timeout("git push", git(worktree, &args))
+        .await
+        .map(drop)
 }
 
 #[cfg(test)]
@@ -282,7 +338,6 @@ mod tests {
             run(&wt.path, &["symbolic-ref", "--short", "HEAD"]),
             "helm/HELM-3"
         );
-        assert_eq!(commits_ahead(&remote.repo, &wt.path).await.unwrap(), 0);
         assert_eq!(default_branch(&remote.repo).await.unwrap(), "main");
         // The main checkout stays on main and clean.
         assert_eq!(
@@ -306,7 +361,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(again, first);
-        assert_eq!(commits_ahead(&remote.repo, &again.path).await.unwrap(), 1);
 
         // The directory is deleted behind git's back; the branch and its commit survive.
         std::fs::remove_dir_all(&first.path).unwrap();
@@ -314,7 +368,104 @@ mod tests {
             .await
             .unwrap();
         assert!(revived.path.join("work.txt").exists());
-        assert_eq!(commits_ahead(&remote.repo, &revived.path).await.unwrap(), 1);
+    }
+
+    async fn commit(wt: &Worktree, file: &str) {
+        std::fs::write(wt.path.join(file), file).unwrap();
+        run(&wt.path, &["add", "."]);
+        run(&wt.path, &["commit", "-q", "-m", file]);
+    }
+
+    async fn card_worktree(remote: &Remote) -> Worktree {
+        prepare_worktree(&remote.repo, &remote.worktrees, "HELM", 1)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_branch_origin_does_not_have_is_compared_with_the_default_branch() {
+        let remote = Remote::new("git-unpublished-new");
+        let wt = card_worktree(&remote).await;
+        let state = unpublished(&remote.repo, &wt).await.unwrap();
+        assert_eq!(state, Unpublished::Nothing);
+
+        commit(&wt, "a").await;
+        commit(&wt, "b").await;
+        let state = unpublished(&remote.repo, &wt).await.unwrap();
+        assert_eq!(state, Unpublished::Commits(2));
+    }
+
+    #[tokio::test]
+    async fn a_branch_equal_to_origins_has_nothing_to_publish_and_one_ahead_has_the_difference() {
+        let remote = Remote::new("git-unpublished-equal");
+        let wt = card_worktree(&remote).await;
+        commit(&wt, "a").await;
+        push(&wt.path, &wt.branch).await.unwrap();
+        let state = unpublished(&remote.repo, &wt).await.unwrap();
+        assert_eq!(state, Unpublished::Nothing);
+
+        commit(&wt, "b").await;
+        let state = unpublished(&remote.repo, &wt).await.unwrap();
+        assert_eq!(state, Unpublished::Commits(1));
+
+        run(&wt.path, &["reset", "-q", "--hard", "HEAD~2"]);
+        let state = unpublished(&remote.repo, &wt).await.unwrap();
+        assert_eq!(state, Unpublished::Nothing, "behind origin adds nothing");
+    }
+
+    #[tokio::test]
+    async fn a_branch_deleted_on_origin_is_republished_despite_a_stale_tracking_ref() {
+        let remote = Remote::new("git-unpublished-stale");
+        let wt = card_worktree(&remote).await;
+        commit(&wt, "a").await;
+        push(&wt.path, &wt.branch).await.unwrap();
+        run(&remote.origin, &["branch", "-q", "-D", &wt.branch]);
+        assert_eq!(
+            run(&wt.path, &["rev-parse", "origin/helm/HELM-1"]),
+            run(&wt.path, &["rev-parse", "HEAD"]),
+            "the local tracking ref still says the branch is on origin"
+        );
+
+        let state = unpublished(&remote.repo, &wt).await.unwrap();
+        assert_eq!(state, Unpublished::Commits(1));
+    }
+
+    #[tokio::test]
+    async fn a_branch_whose_pushed_history_was_rewritten_or_extended_elsewhere_has_diverged() {
+        let remote = Remote::new("git-unpublished-diverged");
+        let wt = card_worktree(&remote).await;
+        commit(&wt, "a").await;
+        push(&wt.path, &wt.branch).await.unwrap();
+        run(&wt.path, &["commit", "-q", "--amend", "-m", "amended"]);
+        let state = unpublished(&remote.repo, &wt).await.unwrap();
+        assert_eq!(state, Unpublished::Diverged);
+
+        // Origin gains a commit this repository has never seen.
+        let other = remote.dir.join("other");
+        run(
+            &remote.dir,
+            &["clone", "-q", remote.origin.to_str().unwrap(), "other"],
+        );
+        run(&other, &["checkout", "-q", &wt.branch]);
+        std::fs::write(other.join("elsewhere"), "x").unwrap();
+        run(&other, &["add", "."]);
+        run(&other, &["commit", "-q", "-m", "elsewhere"]);
+        run(&other, &["push", "-q", "--force", "origin", &wt.branch]);
+        let state = unpublished(&remote.repo, &wt).await.unwrap();
+        assert_eq!(state, Unpublished::Diverged);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_origin_is_an_error_not_an_empty_answer() {
+        let remote = Remote::new("git-unpublished-down");
+        let wt = card_worktree(&remote).await;
+        commit(&wt, "a").await;
+        run(
+            &wt.path,
+            &["remote", "set-url", "origin", "/nonexistent/origin.git"],
+        );
+        let err = unpublished(&remote.repo, &wt).await.unwrap_err();
+        assert!(err.to_string().starts_with("git ls-remote failed"), "{err}");
     }
 
     #[tokio::test]

@@ -1166,7 +1166,13 @@ mod tests {
             !panel.contains("hook_started"),
             "CLI bookkeeping is not shown"
         );
-        assert!(panel.contains("3 événements enregistrés, 1 non affichés"));
+        assert!(
+            panel.contains("3 événements enregistrés, 1 non affichés (1 de bruit interne du CLI)")
+        );
+        assert!(
+            !panel.contains("plus anciens"),
+            "nothing is older than the limit here: {panel}"
+        );
         assert!(panel.find("Bash:").unwrap() < panel.find("boom").unwrap());
         assert!(
             !panel.contains("<form class=\"form\""),

@@ -47,6 +47,33 @@ hang)
     sed -n 2p "$here/claude-success.jsonl"
     sleep 60
     ;;
+wait_then_success)
+    sed -n 1,2p "$here/claude-success.jsonl"
+    while [ ! -e "$(pwd).go" ]; do sleep 0.05; done
+    commit
+    tail -n +3 "$here/claude-success.jsonl"
+    ;;
+long_line)
+    commit
+    sed -n 1,2p "$here/claude-success.jsonl"
+    head -c 3000000 /dev/zero | tr '\0' 'x'
+    echo
+    tail -n +3 "$here/claude-success.jsonl"
+    ;;
+group_child)
+    sleep 300 &
+    echo $! > "$(pwd).child"
+    sed -n 2p "$here/claude-success.jsonl"
+    wait
+    ;;
+session_child)
+    setsid sleep 300 &
+    child=$!
+    trap 'kill $child; exit 143' TERM
+    echo $child > "$(pwd).child"
+    sed -n 2p "$here/claude-success.jsonl"
+    wait
+    ;;
 silent_success)
     commit
     ;;

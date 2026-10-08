@@ -3,6 +3,7 @@
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -13,6 +14,7 @@ pub const DEFAULT_DB_PATH: &str = "helm.db";
 pub const DEFAULT_CONFIG_FILE: &str = "helm.toml";
 pub const DEFAULT_CLAUDE_COMMAND: &str = "claude";
 pub const DEFAULT_MAX_CONCURRENT_RUNS: usize = 2;
+pub const DEFAULT_RUN_TIMEOUT_MINUTES: u64 = 60;
 const DEFAULT_WORKTREE_SUBPATH: &str = ".local/share/helm/worktrees";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +37,7 @@ pub struct ProjectConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentsConfig {
     pub max_concurrent: usize,
+    pub run_timeout: Duration,
     pub claude: ClaudeConfig,
 }
 
@@ -105,6 +108,7 @@ struct FileProject {
 #[serde(deny_unknown_fields)]
 struct FileAgents {
     max_concurrent: Option<usize>,
+    run_timeout_minutes: Option<u64>,
     #[serde(default)]
     claude: FileClaude,
 }
@@ -196,6 +200,8 @@ impl Config {
                         "project.repo and project.worktree_root must not be empty".to_owned(),
                     ));
                 }
+                require_absolute("project.repo", &repo)?;
+                require_absolute("project.worktree_root", &worktree_root)?;
                 Some(ProjectConfig {
                     repo,
                     worktree_root,
@@ -212,6 +218,20 @@ impl Config {
                 "agents.max_concurrent must be at least 1".to_owned(),
             ));
         }
+        let timeout_minutes = file
+            .agents
+            .run_timeout_minutes
+            .unwrap_or(DEFAULT_RUN_TIMEOUT_MINUTES);
+        let run_timeout = timeout_minutes
+            .checked_mul(60)
+            .filter(|seconds| *seconds > 0 && *seconds <= u64::from(u32::MAX))
+            .map(Duration::from_secs)
+            .ok_or_else(|| {
+                ConfigError(format!(
+                    "agents.run_timeout_minutes must be between 1 and {} (got {timeout_minutes})",
+                    u32::MAX / 60
+                ))
+            })?;
         let claude = file.agents.claude;
         let command = claude
             .command
@@ -228,6 +248,7 @@ impl Config {
             project,
             agents: AgentsConfig {
                 max_concurrent,
+                run_timeout,
                 claude: ClaudeConfig {
                     command,
                     permission_mode: claude.permission_mode.unwrap_or(PermissionMode::DEFAULT),
@@ -246,6 +267,16 @@ impl Config {
             RunGate::Open
         }
     }
+}
+
+fn require_absolute(key: &str, path: &Path) -> Result<(), ConfigError> {
+    if path.is_absolute() {
+        return Ok(());
+    }
+    Err(ConfigError(format!(
+        "{key} must be an absolute path (got `{}`); write the full path or start it with `~/`",
+        path.display()
+    )))
 }
 
 /// Expands a leading `~` or `~/`; the shell does not do it for a path read from a file.
@@ -310,6 +341,7 @@ mod tests {
         let config = Config::resolve(None, no_env).unwrap();
         assert_eq!(config.project, None);
         assert_eq!(config.agents.max_concurrent, DEFAULT_MAX_CONCURRENT_RUNS);
+        assert_eq!(config.agents.run_timeout, Duration::from_secs(60 * 60));
         assert_eq!(config.agents.claude.command, PathBuf::from("claude"));
         assert_eq!(
             config.agents.claude.permission_mode,
@@ -343,6 +375,7 @@ mod tests {
 
             [agents]
             max_concurrent = 4
+            run_timeout_minutes = 90
 
             [agents.claude]
             command = "/opt/claude"
@@ -354,6 +387,7 @@ mod tests {
         assert_eq!(project.repo, PathBuf::from("/home/dev/code/app"));
         assert_eq!(project.worktree_root, PathBuf::from("/srv/wt"));
         assert_eq!(config.agents.max_concurrent, 4);
+        assert_eq!(config.agents.run_timeout, Duration::from_secs(90 * 60));
         assert_eq!(config.agents.claude.command, PathBuf::from("/opt/claude"));
         assert_eq!(
             config.agents.claude.permission_mode,
@@ -366,16 +400,45 @@ mod tests {
     fn invalid_agent_settings_fail_the_startup() {
         for bad in [
             "[agents]\nmax_concurrent = 0",
+            "[agents]\nrun_timeout_minutes = 0",
+            "[agents]\nrun_timeout_minutes = 18446744073709551615",
             "[agents]\nunknown = 1",
             "[agents.claude]\npermission_mode = \"yolo\"",
             "[agents.claude]\nmodel = \"--oops\"",
             "[agents.claude]\ncommand = \"\"",
             "[project]\nrepo = \"\"",
+            "[project]\nrepo = \"code/app\"",
+            "[project]\nrepo = \"./app\"",
+            "[project]\nrepo = \"/r\"\nworktree_root = \"worktrees\"",
+            "[project]\nrepo = \"/r\"\nworktree_root = \"../wt\"",
             "[project]\nbranch = \"main\"",
             "[project]\nworktree_root = \"/srv/wt\"",
         ] {
             assert!(Config::resolve(Some(bad), home_env).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_relative_repo_or_worktree_root_names_the_key_and_the_value() {
+        let relative_root = "[project]\nrepo = \"/r\"\nworktree_root = \"wt/cards\"";
+        let message = Config::resolve(Some(relative_root), home_env)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("project.worktree_root")
+                && message.contains("wt/cards")
+                && message.contains("absolute"),
+            "{message}"
+        );
+        let message = Config::resolve(Some("[project]\nrepo = \"code/app\""), home_env)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("project.repo") && message.contains("code/app"),
+            "{message}"
+        );
+        let relative_home = |key: &str| (key == "HOME").then(|| "home/dev".to_owned());
+        assert!(Config::resolve(Some("[project]\nrepo = \"/r\""), relative_home).is_err());
     }
 
     #[test]
