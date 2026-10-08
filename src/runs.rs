@@ -585,15 +585,26 @@ pub fn running_runs(conn: &Connection) -> Result<Vec<Orphan>> {
         .collect::<rusqlite::Result<_>>()?)
 }
 
-pub fn possibly_orphaned_pids(conn: &Connection, card_id: i64, before: RunId) -> Result<Vec<i64>> {
+/// The pid of the card's most recent earlier run that launched an agent, when that run was
+/// `interrupted`: the only one whose process group Helm may still have to wait for. A later
+/// run that launched an agent passed this check itself, so older pids are history and could
+/// by now belong to an unrelated process.
+pub fn possibly_orphaned_pid(
+    conn: &Connection,
+    card_id: i64,
+    before: RunId,
+) -> Result<Option<i64>> {
     Ok(conn
-        .prepare(
-            "SELECT pid FROM agent_runs
-             WHERE card_id = ?1 AND id < ?2 AND status = 'interrupted' AND pid IS NOT NULL
-             ORDER BY id DESC",
-        )?
-        .query_map((card_id, before), |row| row.get(0))?
-        .collect::<rusqlite::Result<_>>()?)
+        .query_row(
+            "SELECT pid FROM (
+                 SELECT pid, status FROM agent_runs
+                 WHERE card_id = ?1 AND id < ?2 AND pid IS NOT NULL
+                 ORDER BY id DESC LIMIT 1)
+             WHERE status = 'interrupted'",
+            (card_id, before),
+            |row| row.get(0),
+        )
+        .optional()?)
 }
 
 /// Appends to a run's log and returns the event's `seq`.

@@ -223,7 +223,7 @@ fn log_store_error(context: &str, error: &StoreError) {
 
 fn still_running_message(pid: i64) -> String {
     format!(
-        "l'agent d'une exécution précédente tourne encore (groupe de processus {pid}) : Helm ne lance pas un second agent dans le même worktree. Arrêtez-le avec `kill -- -{pid}`, puis remettez la carte dans « À faire »."
+        "un groupe de processus {pid} existe encore et pourrait être l'agent d'une exécution précédente : Helm ne lance pas un second agent dans le même worktree. Vérifiez d'abord ce qu'il est (par exemple `pgrep -a -g {pid}`), car ce numéro a pu être réutilisé par un autre programme. Si c'est bien l'agent, arrêtez-le avec `kill -- -{pid}`, puis remettez la carte dans « À faire »."
     )
 }
 
@@ -497,15 +497,14 @@ impl Supervisor {
 
         let earlier = self
             .db
-            .call(move |conn| runs::possibly_orphaned_pids(conn, card_id, id))
+            .call(move |conn| runs::possibly_orphaned_pid(conn, card_id, id))
             .await;
         match earlier {
             Err(e) => return Outcome::Failed(format!("exécutions précédentes illisibles : {e}")),
-            Ok(pids) => {
-                if let Some(pid) = pids.into_iter().find(|pid| group_exists(*pid)) {
-                    return self.fail(id, still_running_message(pid)).await;
-                }
+            Ok(Some(pid)) if group_exists(pid) => {
+                return self.fail(id, still_running_message(pid)).await;
             }
+            Ok(_) => {}
         }
 
         let prepared = unless_cancelled(
@@ -1869,13 +1868,85 @@ mod tests {
             "Helm does not kill a process it cannot identify"
         );
 
+        assert!(
+            error.contains(&format!("pgrep -a -g {orphan_pid}")),
+            "the card says to check what the process is first: {error}"
+        );
+
+        // The refusal is itself the latest run, and it must not lift the block.
+        h.requeue(card).await;
+        let refused_again = h
+            .wait_for(card, |r| r.id > refused.id && !r.status.is_active())
+            .await;
+        assert_eq!(
+            refused_again.status,
+            RunStatus::Failed,
+            "{:?}",
+            refused_again.error
+        );
+        assert!(refused_again.pid.is_none());
+
         orphan.kill().unwrap();
         orphan.wait().unwrap();
         h.requeue(card).await;
         let run = h
-            .wait_for(card, |r| r.id > refused.id && !r.status.is_active())
+            .wait_for(card, |r| r.id > refused_again.id && !r.status.is_active())
             .await;
         assert_eq!(run.status, RunStatus::Succeeded, "{:?}", run.error);
+    }
+
+    #[tokio::test]
+    async fn a_pid_from_before_a_later_run_that_launched_an_agent_no_longer_blocks_the_card() {
+        let mut h = Harness::new("sup-stale-pid");
+        h.task.abort();
+        let card = h.card("success", "").await;
+        let interrupted =
+            h.db.call(|conn| {
+                let run = runs::claim_next_queued(conn)?.unwrap();
+                runs::record_pid(conn, run.id, 2_000_000_000)?;
+                Ok::<_, StoreError>(run.id)
+            })
+            .await
+            .unwrap();
+        recover(&h.db, &h.changes).await.unwrap();
+        h.restart();
+        h.requeue(card).await;
+        let later = h
+            .wait_for(card, |r| r.id > interrupted && !r.status.is_active())
+            .await;
+        assert_eq!(later.status, RunStatus::Succeeded, "{:?}", later.error);
+        assert!(later.pid.is_some(), "the later run launched an agent");
+
+        // Long afterwards the old pid names an unrelated, live process group.
+        use std::os::unix::process::CommandExt;
+        let mut stranger = std::process::Command::new("sleep")
+            .arg("302")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let stranger_pid = stranger.id();
+        h.db.call(move |conn| {
+            conn.execute(
+                "UPDATE agent_runs SET pid = ?2 WHERE id = ?1",
+                (interrupted, i64::from(stranger_pid)),
+            )?;
+            Ok::<_, StoreError>(())
+        })
+        .await
+        .unwrap();
+        h.requeue(card).await;
+        let run = h
+            .wait_for(card, |r| r.id > later.id && !r.status.is_active())
+            .await;
+        stranger.kill().unwrap();
+        stranger.wait().unwrap();
+
+        let reason = run.error.as_deref().unwrap_or_default();
+        assert!(
+            !reason.contains(&format!("-{stranger_pid}")),
+            "an old interrupted run no longer blocks: {reason}"
+        );
+        assert!(run.pid.is_some(), "the agent was launched: {reason}");
     }
 
     #[tokio::test]

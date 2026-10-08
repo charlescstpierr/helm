@@ -279,8 +279,11 @@ codex exec --json "<consigne>"                          # prévu ; reprise : cod
   Au démarrage, toute exécution encore `running` en base passe à `interrupted` — jamais
   relancée en silence ; si son processus existe encore, l'erreur le dit (Helm ne peut plus le
   superviser et ne tue pas un pid qu'il ne peut pas identifier). Pour la même raison, une
-  nouvelle exécution est refusée tant que le groupe de processus d'une exécution interrompue de
-  la carte existe encore, avec la commande qui l'arrête. Une seule exécution active par
+  nouvelle exécution est refusée tant que le groupe de processus de la dernière exécution de la
+  carte ayant lancé un agent existe encore, si celle-ci a été interrompue (une exécution plus
+  récente qui a lancé un agent a passé ce contrôle : les pid plus anciens ne comptent plus, un
+  autre programme a pu les réutiliser). Le message dit de vérifier ce qu'est ce processus avant de
+  l'arrêter, puis donne la commande. Une seule exécution active par
   carte (index unique partiel).
 - **Fin de travail : pousser la branche.** Après un succès de l'agent, Helm demande à
   `origin` où en est la branche (`git ls-remote`, jamais la copie locale `origin/<branche>`, qui peut
