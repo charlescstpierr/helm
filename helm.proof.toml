@@ -1,0 +1,9 @@
+bind = "127.0.0.1:7979"
+db_path = "/tmp/helm-proof/helm.db"
+
+[project]
+repo = "/tmp/helm-proof/repo"
+worktree_root = "/tmp/helm-proof/wt"
+
+[agents.claude]
+model = "haiku"
