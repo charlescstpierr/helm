@@ -15,6 +15,8 @@ pub const DEFAULT_CONFIG_FILE: &str = "helm.toml";
 pub const DEFAULT_CLAUDE_COMMAND: &str = "claude";
 pub const DEFAULT_MAX_CONCURRENT_RUNS: usize = 2;
 pub const DEFAULT_RUN_TIMEOUT_MINUTES: u64 = 60;
+pub const DEFAULT_CHECK_TIMEOUT_MINUTES: u64 = 10;
+pub const DEFAULT_GITHUB_COMMAND: &str = "gh";
 const DEFAULT_WORKTREE_SUBPATH: &str = ".local/share/helm/worktrees";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +26,8 @@ pub struct Config {
     /// `None` leaves the board as a plain kanban: agents cannot be assigned.
     pub project: Option<ProjectConfig>,
     pub agents: AgentsConfig,
+    pub checks: ChecksConfig,
+    pub github: Option<GithubConfig>,
 }
 
 /// The git repository the board's cards are worked on in.
@@ -47,6 +51,27 @@ pub struct ClaudeConfig {
     pub permission_mode: PermissionMode,
     /// Used when a card names no model; `None` leaves the choice to the CLI.
     pub model: Option<ModelName>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChecksConfig {
+    pub commands: Vec<String>,
+    pub timeout: Duration,
+}
+
+impl Default for ChecksConfig {
+    fn default() -> Self {
+        Self {
+            commands: Vec::new(),
+            timeout: Duration::from_secs(DEFAULT_CHECK_TIMEOUT_MINUTES * 60),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubConfig {
+    pub repository: String,
+    pub command: PathBuf,
 }
 
 /// Whether Helm may start agents, decided once from the configuration.
@@ -95,6 +120,9 @@ struct FileConfig {
     project: FileProject,
     #[serde(default)]
     agents: FileAgents,
+    #[serde(default)]
+    checks: FileChecks,
+    github: Option<FileGithub>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -119,6 +147,21 @@ struct FileClaude {
     command: Option<PathBuf>,
     permission_mode: Option<PermissionMode>,
     model: Option<ModelName>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileChecks {
+    #[serde(default)]
+    commands: Vec<String>,
+    timeout_minutes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileGithub {
+    repository: String,
+    command: Option<PathBuf>,
 }
 
 fn read_optional(path: &str) -> Result<Option<String>, ConfigError> {
@@ -222,16 +265,7 @@ impl Config {
             .agents
             .run_timeout_minutes
             .unwrap_or(DEFAULT_RUN_TIMEOUT_MINUTES);
-        let run_timeout = timeout_minutes
-            .checked_mul(60)
-            .filter(|seconds| *seconds > 0 && *seconds <= u64::from(u32::MAX))
-            .map(Duration::from_secs)
-            .ok_or_else(|| {
-                ConfigError(format!(
-                    "agents.run_timeout_minutes must be between 1 and {} (got {timeout_minutes})",
-                    u32::MAX / 60
-                ))
-            })?;
+        let run_timeout = minutes_to_duration("agents.run_timeout_minutes", timeout_minutes)?;
         let claude = file.agents.claude;
         let command = claude
             .command
@@ -241,6 +275,43 @@ impl Config {
                 "agents.claude.command must not be empty".to_owned(),
             ));
         }
+
+        for (position, command) in file.checks.commands.iter().enumerate() {
+            if command.trim().is_empty() {
+                return Err(ConfigError(format!(
+                    "checks.commands[{position}] must not be empty"
+                )));
+            }
+        }
+        let checks = ChecksConfig {
+            commands: file.checks.commands,
+            timeout: minutes_to_duration(
+                "checks.timeout_minutes",
+                file.checks
+                    .timeout_minutes
+                    .unwrap_or(DEFAULT_CHECK_TIMEOUT_MINUTES),
+            )?,
+        };
+        let github = file
+            .github
+            .map(|github| {
+                if !valid_github_repository(&github.repository) {
+                    return Err(ConfigError(
+                        "github.repository must name a GitHub repository as owner/repo".to_owned(),
+                    ));
+                }
+                let command = github
+                    .command
+                    .unwrap_or_else(|| PathBuf::from(DEFAULT_GITHUB_COMMAND));
+                if command.as_os_str().is_empty() {
+                    return Err(ConfigError("github.command must not be empty".to_owned()));
+                }
+                Ok(GithubConfig {
+                    repository: github.repository,
+                    command,
+                })
+            })
+            .transpose()?;
 
         Ok(Self {
             bind,
@@ -255,6 +326,8 @@ impl Config {
                     model: claude.model,
                 },
             },
+            checks,
+            github,
         })
     }
 
@@ -267,6 +340,37 @@ impl Config {
             RunGate::Open
         }
     }
+}
+
+fn minutes_to_duration(key: &str, minutes: u64) -> Result<Duration, ConfigError> {
+    minutes
+        .checked_mul(60)
+        .filter(|seconds| *seconds > 0 && *seconds <= u64::from(u32::MAX))
+        .map(Duration::from_secs)
+        .ok_or_else(|| {
+            ConfigError(format!(
+                "{key} must be between 1 and {} (got {minutes})",
+                u32::MAX / 60
+            ))
+        })
+}
+
+fn valid_github_repository(repository: &str) -> bool {
+    let Some((owner, name)) = repository.split_once('/') else {
+        return false;
+    };
+    !owner.is_empty()
+        && owner.len() <= 39
+        && owner.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && owner.ends_with(|c: char| c.is_ascii_alphanumeric())
+        && owner.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && !name.is_empty()
+        && name.len() <= 100
+        && name != "."
+        && name != ".."
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
 }
 
 fn require_absolute(key: &str, path: &Path) -> Result<(), ConfigError> {
@@ -415,6 +519,155 @@ mod tests {
             "[project]\nworktree_root = \"/srv/wt\"",
         ] {
             assert!(Config::resolve(Some(bad), home_env).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn accepts_checks_with_defaults_or_custom_settings() {
+        for (file, commands, timeout_minutes) in [
+            ("[checks]", vec![], 10),
+            (
+                "[checks]\ncommands = [\"cargo fmt --check\", \"cargo test\"]\ntimeout_minutes = 5",
+                vec!["cargo fmt --check", "cargo test"],
+                5,
+            ),
+            ("[checks]\ntimeout_minutes = 71582788", vec![], 71582788),
+        ] {
+            let config = Config::resolve(Some(file), no_env).unwrap();
+            assert_eq!(config.checks.commands, commands);
+            assert_eq!(
+                config.checks.timeout,
+                Duration::from_secs(timeout_minutes * 60)
+            );
+        }
+    }
+
+    #[test]
+    fn checks_default_to_no_commands_and_github_is_disabled() {
+        let config = Config::resolve(None, no_env).unwrap();
+        assert_eq!(config.checks, ChecksConfig::default());
+        assert!(config.checks.commands.is_empty());
+        assert_eq!(config.checks.timeout, Duration::from_secs(10 * 60));
+        assert_eq!(config.github, None);
+    }
+
+    #[test]
+    fn accepts_github_with_default_or_custom_command() {
+        for (file, repository, command) in [
+            ("[github]\nrepository = \"owner/repo\"", "owner/repo", "gh"),
+            (
+                "[github]\nrepository = \"my-org/my.repo_2\"\ncommand = \"/opt/bin/gh\"",
+                "my-org/my.repo_2",
+                "/opt/bin/gh",
+            ),
+            (
+                "[github]\nrepository = \"owner/.github\"",
+                "owner/.github",
+                "gh",
+            ),
+        ] {
+            let github = Config::resolve(Some(file), no_env).unwrap().github.unwrap();
+            assert_eq!(github.repository, repository);
+            assert_eq!(github.command, PathBuf::from(command));
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_or_wrongly_typed_checks_and_github_settings() {
+        for file in [
+            "[checks]\ncommand = \"cargo test\"",
+            "[checks]\ncommands = \"cargo test\"",
+            "[checks]\ncommands = [1]",
+            "[checks]\ntimeout_minutes = -1",
+            "[checks]\ntimeout_minutes = 0.5",
+            "[github]\nrepository = \"owner/repo\"\nunknown = true",
+            "[github]\nrepository = 1",
+            "[github]\nrepository = \"owner/repo\"\ncommand = 1",
+        ] {
+            assert!(Config::resolve(Some(file), no_env).is_err(), "{file}");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_checks_settings_with_the_setting_name() {
+        for value in ["0", "71582789", "18446744073709551615"] {
+            let file = format!("[checks]\ntimeout_minutes = {value}");
+            let error = Config::resolve(Some(&file), no_env)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("checks.timeout_minutes"), "{error}");
+        }
+    }
+
+    #[test]
+    fn rejects_blank_check_commands_with_their_position() {
+        for (file, position) in [
+            (
+                r#"[checks]
+commands = [""]"#,
+                0,
+            ),
+            (
+                r#"[checks]
+commands = [" \n"]"#,
+                0,
+            ),
+            (
+                r#"[checks]
+commands = ["cargo test", ""]"#,
+                1,
+            ),
+        ] {
+            let error = Config::resolve(Some(file), no_env).unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("checks.commands[{position}]")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_nonempty_check_commands_verbatim() {
+        let file = r#"[checks]
+commands = ["  cargo test \n", "printf 'hello world'"]"#;
+        let checks = Config::resolve(Some(file), no_env).unwrap().checks;
+        assert_eq!(checks.commands, ["  cargo test \n", "printf 'hello world'"]);
+    }
+
+    #[test]
+    fn rejects_invalid_github_repository_with_the_setting_name() {
+        for repository in [
+            "",
+            "repo",
+            "owner/",
+            "/repo",
+            "owner/repo/extra",
+            "owner /repo",
+            "owner/re po",
+            "https://github.com/owner/repo",
+            "-owner/repo",
+            "owner/..",
+            "owner/repo?arg=1",
+        ] {
+            let file = format!("[github]\nrepository = {repository:?}");
+            let error = Config::resolve(Some(&file), no_env)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("github.repository"), "{repository}: {error}");
+        }
+    }
+
+    #[test]
+    fn rejects_github_without_a_repository_or_with_an_empty_command() {
+        for (file, key) in [
+            ("[github]", "repository"),
+            (
+                "[github]\nrepository = \"owner/repo\"\ncommand = \"\"",
+                "github.command",
+            ),
+        ] {
+            let error = Config::resolve(Some(file), no_env).unwrap_err().to_string();
+            assert!(error.contains(key), "{error}");
         }
     }
 

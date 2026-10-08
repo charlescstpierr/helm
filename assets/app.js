@@ -352,7 +352,7 @@
     try {
       await post(form.action, new URLSearchParams());
     } catch (error) {
-      announce(`Annulation impossible : ${error.message}`);
+      announce(`Action impossible : ${error.message}`);
     } finally {
       delete form.dataset.submitting;
     }
