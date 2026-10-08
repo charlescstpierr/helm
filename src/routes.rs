@@ -18,9 +18,11 @@ use tokio::sync::broadcast::error::RecvError;
 use crate::agent::{Agent, ModelName};
 use crate::assets;
 use crate::changes::Changes;
+use crate::checks::{self, Verification, VerificationStatus};
 use crate::config::RunGate;
 use crate::db::Db;
-use crate::runs::{self, Activity, RunId};
+use crate::delivery::{self, CardPullRequest, Delivery};
+use crate::runs::{self, Activity, Run, RunId, RunStatus};
 use crate::store::{self, Author, Board, Card, CardInput, Comment, StoreError};
 use crate::supervisor::Orchestrator;
 
@@ -36,6 +38,7 @@ pub struct AppState {
     db: Db,
     changes: Changes,
     orchestrator: Orchestrator,
+    delivery: Option<Delivery>,
     /// When bound to loopback, only loopback `Host` names are served (DNS-rebinding guard).
     loopback_only: bool,
 }
@@ -90,8 +93,26 @@ impl AppState {
             db,
             changes: Changes::new(),
             orchestrator,
+            delivery: None,
             loopback_only,
         }
+    }
+
+    pub fn with_delivery(mut self, delivery: Delivery) -> Self {
+        self.orchestrator.set_delivery_locks(delivery.locks());
+        self.delivery = Some(delivery);
+        self
+    }
+
+    fn github_enabled(&self) -> bool {
+        self.delivery.as_ref().is_some_and(Delivery::enabled)
+    }
+
+    fn github_delivery(&self) -> AppResult<&Delivery> {
+        self.delivery
+            .as_ref()
+            .filter(|delivery| delivery.enabled())
+            .ok_or_else(|| AppError::Conflict("GitHub désactivé pour ce projet.".to_owned()))
     }
 
     /// The notifier the background supervisor shares with the handlers.
@@ -121,6 +142,15 @@ pub fn router(state: AppState) -> Router {
             get(comment_thread).post(add_comment),
         )
         .route("/cards/{id}/activity", get(card_activity))
+        .route(
+            "/cards/{id}/pull-request/publish",
+            post(publish_pull_request),
+        )
+        .route(
+            "/cards/{id}/pull-request/refresh",
+            post(refresh_pull_request),
+        )
+        .route("/cards/{id}/pull-request/merge", post(merge_pull_request))
         .route(
             "/cards/{id}/delete",
             get(confirm_delete_card).post(delete_card),
@@ -291,6 +321,9 @@ struct CardEditPage {
     card: Card,
     comments: Vec<Comment>,
     activity: Activity,
+    verification: Option<Verification>,
+    delivery: Option<CardPullRequest>,
+    github_enabled: bool,
     agents: AgentsView,
 }
 
@@ -301,6 +334,9 @@ struct CardPanelFragment {
     card: Card,
     comments: Vec<Comment>,
     activity: Activity,
+    verification: Option<Verification>,
+    delivery: Option<CardPullRequest>,
+    github_enabled: bool,
     agents: AgentsView,
 }
 
@@ -308,6 +344,47 @@ struct CardPanelFragment {
 #[template(path = "_activity.html")]
 struct ActivityFragment {
     activity: Activity,
+    verification: Option<Verification>,
+    delivery: Option<CardPullRequest>,
+    github_enabled: bool,
+}
+
+fn can_publish(
+    run: &Run,
+    verification: &Option<Verification>,
+    delivery: &Option<CardPullRequest>,
+) -> bool {
+    run.status == RunStatus::Succeeded
+        && run.pushed_at.is_some()
+        && run.branch.is_some()
+        && verification.as_ref().is_some_and(|verification| {
+            matches!(
+                verification.status,
+                VerificationStatus::Passed | VerificationStatus::Skipped
+            )
+        })
+        && delivery.as_ref().is_none_or(|delivery| {
+            delivery.run_id != run.id
+                || (delivery.error.is_some()
+                    && delivery.pr.state != crate::github::PullRequestState::Merged)
+        })
+}
+
+fn can_merge(run: &Run, verification: &Option<Verification>, delivery: &CardPullRequest) -> bool {
+    run.status == RunStatus::Succeeded
+        && run.pushed_at.is_some()
+        && delivery.run_id == run.id
+        && run.branch.as_deref() == Some(delivery.pr.head_branch.as_str())
+        && delivery.expected_base == delivery.pr.base_branch
+        && delivery.error.is_none()
+        && delivery.pr.merge_blocker().is_none()
+        && verification.as_ref().is_some_and(|verification| {
+            verification.commit_sha == delivery.pr.head_sha
+                && matches!(
+                    verification.status,
+                    VerificationStatus::Passed | VerificationStatus::Skipped
+                )
+        })
 }
 
 #[derive(Template)]
@@ -346,24 +423,37 @@ async fn edit_card(
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> AppResult<Html<String>> {
-    let (board, card, comments, activity) = state
+    let (board, card, comments, activity, verification, delivery) = state
         .db
         .call(move |conn| {
+            let activity = runs::activity(conn, id)?;
+            let verification = activity
+                .run
+                .as_ref()
+                .map(|run| checks::get(conn, run.id))
+                .transpose()?
+                .flatten();
             Ok::<_, StoreError>((
                 store::load_board(conn)?,
                 store::get_card(conn, id)?,
                 store::list_comments(conn, id)?,
-                runs::activity(conn, id)?,
+                activity,
+                verification,
+                delivery::get(conn, id)?,
             ))
         })
         .await?;
     let agents = state.agents();
+    let github_enabled = state.github_enabled();
     let html = if is_fetch(&headers) {
         CardPanelFragment {
             board,
             card,
             comments,
             activity,
+            verification,
+            delivery,
+            github_enabled,
             agents,
         }
         .render()?
@@ -373,6 +463,9 @@ async fn edit_card(
             card,
             comments,
             activity,
+            verification,
+            delivery,
+            github_enabled,
             agents,
         }
         .render()?
@@ -384,14 +477,29 @@ async fn card_activity(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> AppResult<Html<String>> {
-    let activity = state
+    let (activity, verification, delivery) = state
         .db
         .call(move |conn| {
             store::get_card(conn, id)?;
-            runs::activity(conn, id)
+            let activity = runs::activity(conn, id)?;
+            let verification = activity
+                .run
+                .as_ref()
+                .map(|run| checks::get(conn, run.id))
+                .transpose()?
+                .flatten();
+            Ok::<_, StoreError>((activity, verification, delivery::get(conn, id)?))
         })
         .await?;
-    Ok(Html(ActivityFragment { activity }.render()?))
+    Ok(Html(
+        ActivityFragment {
+            activity,
+            verification,
+            delivery,
+            github_enabled: state.github_enabled(),
+        }
+        .render()?,
+    ))
 }
 
 async fn comment_thread(
@@ -496,6 +604,7 @@ async fn update_card(
     state
         .db
         .call(move |conn| {
+            orchestrator.ensure_card_available(id)?;
             let current = store::get_card(conn, id)?.agent;
             check_assignment(&agents, current, &input.agent)?;
             let entered = store::update_card(conn, id, column_id, &input)?;
@@ -516,6 +625,7 @@ async fn move_card(
     state
         .db
         .call(move |conn| {
+            orchestrator.ensure_card_available(id)?;
             let entered = store::move_card(conn, id, form.column_id, form.position)?;
             orchestrator.after_placement(conn, id, entered)
         })
@@ -529,9 +639,13 @@ async fn delete_card(
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> AppResult<Response> {
+    let orchestrator = state.orchestrator.clone();
     state
         .db
-        .call(move |conn| store::delete_card(conn, id))
+        .call(move |conn| {
+            orchestrator.ensure_card_available(id)?;
+            store::delete_card(conn, id)
+        })
         .await?;
     state.board_changed();
     Ok(written(&headers))
@@ -548,6 +662,56 @@ async fn cancel_run(
         Ok(StatusCode::NO_CONTENT.into_response())
     } else {
         Ok(Redirect::to(&format!("/cards/{card_id}/edit")).into_response())
+    }
+}
+
+async fn publish_pull_request(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+) -> AppResult<Response> {
+    state.db.call(move |conn| store::get_card(conn, id)).await?;
+    state
+        .github_delivery()?
+        .retry(id)
+        .await
+        .map_err(AppError::Conflict)?;
+    Ok(delivery_written(&headers, id))
+}
+
+async fn refresh_pull_request(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+) -> AppResult<Response> {
+    state.db.call(move |conn| store::get_card(conn, id)).await?;
+    state
+        .github_delivery()?
+        .refresh(id)
+        .await
+        .map_err(AppError::Conflict)?;
+    Ok(delivery_written(&headers, id))
+}
+
+async fn merge_pull_request(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+) -> AppResult<Response> {
+    state.db.call(move |conn| store::get_card(conn, id)).await?;
+    state
+        .github_delivery()?
+        .merge(id)
+        .await
+        .map_err(AppError::Conflict)?;
+    Ok(delivery_written(&headers, id))
+}
+
+fn delivery_written(headers: &HeaderMap, card_id: i64) -> Response {
+    if is_fetch(headers) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        Redirect::to(&format!("/cards/{card_id}/edit#run-activity")).into_response()
     }
 }
 
@@ -1123,6 +1287,327 @@ mod tests {
             post_form(&app, "/cards/1/delete", "").await,
             StatusCode::NO_CONTENT
         );
+    }
+
+    #[tokio::test]
+    async fn github_actions_are_explicit_posts_and_refused_when_unconfigured() {
+        let app = app();
+        post_form(&app, "/cards", "column_id=2&title=Task&agent=claude").await;
+
+        for action in ["publish", "refresh", "merge"] {
+            let uri = format!("/cards/1/pull-request/{action}");
+            assert_eq!(
+                send(&app, get(&uri)).await.0,
+                StatusCode::METHOD_NOT_ALLOWED
+            );
+            let forged = post(&uri)
+                .header(header::ORIGIN, "https://evil.example")
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(send(&app, forged).await.0, StatusCode::FORBIDDEN);
+            let (status, _, body) = send(&app, post(&uri).body(Body::empty()).unwrap()).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{action}: {body}");
+            assert!(body.contains("GitHub"), "{body}");
+            let missing = format!("/cards/42/pull-request/{action}");
+            assert_eq!(post_form(&app, &missing, "").await, StatusCode::NOT_FOUND);
+        }
+
+        let (_, _, panel) = send(&app, get("/cards/1/activity")).await;
+        assert!(panel.contains("Non exécutées"), "{panel}");
+        assert!(panel.contains("GitHub désactivé"), "{panel}");
+        assert!(!panel.contains("/pull-request/"), "{panel}");
+    }
+
+    fn delivery_app(db: &Db) -> Router {
+        delivery_app_with_config(
+            db,
+            std::path::PathBuf::from("/unused-rendering-repository"),
+            std::path::PathBuf::from("/github-must-not-run-on-get"),
+        )
+    }
+
+    fn delivery_app_with_config(
+        db: &Db,
+        repo: std::path::PathBuf,
+        command: std::path::PathBuf,
+    ) -> Router {
+        let state = AppState::new(db.clone(), true, orchestrator(RunGate::Open));
+        let delivery = Delivery::new(
+            db.clone(),
+            state.changes(),
+            RunGate::Open,
+            Some(repo),
+            Some(crate::config::GithubConfig {
+                repository: "owner/repo".to_owned(),
+                command,
+            }),
+        );
+        router(state.with_delivery(delivery))
+    }
+
+    async fn store_verified_pull_request(db: &Db) -> RunId {
+        db.call(|conn| {
+            let run = runs::claim_next_queued(conn)?.unwrap();
+            runs::record_workspace(conn, run.id, "/unused-rendering-worktree", "helm/HELM-1")?;
+            let sha = "1234567890123456789012345678901234567890";
+            checks::start(conn, run.id, sha, &["echo '<command>'".to_owned()])?;
+            checks::start_check(conn, run.id, 0)?;
+            checks::finish_check(
+                conn,
+                run.id,
+                0,
+                &crate::process::CommandOutput {
+                    stdout: "<script>bad()</script>".to_owned(),
+                    stderr: "<error>details</error>".to_owned(),
+                    exit_code: Some(0),
+                    timed_out: false,
+                },
+            )?;
+            checks::finish(conn, run.id, VerificationStatus::Passed)?;
+            runs::finish(conn, run.id, &runs::Outcome::Succeeded)?;
+            delivery::record(
+                conn,
+                run.card_id,
+                run.id,
+                "owner/repo",
+                &crate::github::PullRequest {
+                    number: 17,
+                    url: "https://github.com/owner/repo/pull/17".to_owned(),
+                    state: crate::github::PullRequestState::Open,
+                    draft: false,
+                    head_sha: sha.to_owned(),
+                    head_branch: "helm/HELM-1".to_owned(),
+                    base_branch: "main".to_owned(),
+                    checks: crate::github::CiStatus::Passed,
+                    mergeable: "MERGEABLE".to_owned(),
+                    merge_state_status: "CLEAN".to_owned(),
+                    review_decision: "APPROVED".to_owned(),
+                },
+            )?;
+            Ok::<_, StoreError>(run.id)
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn stored_checks_and_pull_requests_render_on_every_card_view_without_remote_calls() {
+        let db = Db::open_in_memory().unwrap();
+        let app = delivery_app(&db);
+        post_form(&app, "/cards", "column_id=2&title=Task&agent=claude").await;
+        store_verified_pull_request(&db).await;
+
+        let before = db
+            .call(|conn| delivery::get(conn, 1))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut dialog = get("/cards/1/edit");
+        dialog
+            .headers_mut()
+            .insert(FETCH_HEADER, HeaderValue::from_static("fetch"));
+        for request in [get("/cards/1/activity"), get("/cards/1/edit"), dialog] {
+            let (status, _, body) = send(&app, request).await;
+            assert_eq!(status, StatusCode::OK);
+            for expected in [
+                "Vérifications locales",
+                "Réussies",
+                "1234567890123456789012345678901234567890",
+                "Code de retour : 0",
+                "https://github.com/owner/repo/pull/17",
+                "Dernière actualisation",
+                "action=\"/cards/1/pull-request/refresh\"",
+                "action=\"/cards/1/pull-request/merge\"",
+                "data-run-form",
+            ] {
+                assert!(body.contains(expected), "missing {expected}: {body}");
+            }
+            assert!(!body.contains("<script>bad()"), "{body}");
+            assert!(!body.contains("<command>"), "{body}");
+            assert!(!body.contains("<error>details"), "{body}");
+            assert!(body.contains("bad()") && body.contains("details"));
+            assert!(!body.contains("/pull-request/publish"));
+        }
+        let after = db
+            .call(|conn| delivery::get(conn, 1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.refreshed_at, after.refreshed_at);
+        assert_eq!(before.pr, after.pr);
+
+        let disabled = router(AppState::new(db.clone(), true, orchestrator(RunGate::Open)));
+        let (_, _, body) = send(&disabled, get("/cards/1/activity")).await;
+        assert!(body.contains("owner/repo #17"));
+        assert!(!body.contains("action=\"/cards/1/pull-request/"));
+
+        db.call(|conn| {
+            conn.execute("DELETE FROM card_pull_requests WHERE card_id = 1", [])?;
+            Ok::<_, StoreError>(())
+        })
+        .await
+        .unwrap();
+        let (_, _, body) = send(&app, get("/cards/1/activity")).await;
+        assert!(body.contains("Aucune PR enregistrée"));
+        assert!(body.contains("/pull-request/publish"));
+        assert!(!body.contains("/pull-request/merge"));
+    }
+
+    #[tokio::test]
+    async fn merge_controls_follow_saved_checks_errors_and_latest_run() {
+        let db = Db::open_in_memory().unwrap();
+        let app = delivery_app(&db);
+        post_form(&app, "/cards", "column_id=2&title=Task&agent=claude").await;
+        let run_id = store_verified_pull_request(&db).await;
+
+        for checks_status in [
+            crate::github::CiStatus::Pending,
+            crate::github::CiStatus::Failed,
+            crate::github::CiStatus::Unknown,
+        ] {
+            db.call(move |conn| {
+                let mut delivery = delivery::get(conn, 1)?.unwrap();
+                delivery.pr.checks = checks_status;
+                delivery::record(conn, 1, run_id, &delivery.repository, &delivery.pr)
+            })
+            .await
+            .unwrap();
+            let (_, _, body) = send(&app, get("/cards/1/activity")).await;
+            assert!(!body.contains("/pull-request/merge"), "{body}");
+        }
+
+        db.call(move |conn| {
+            let mut delivery = delivery::get(conn, 1)?.unwrap();
+            delivery.pr.checks = crate::github::CiStatus::None;
+            delivery::record(conn, 1, run_id, &delivery.repository, &delivery.pr)?;
+            conn.execute("DELETE FROM run_verifications WHERE run_id = ?1", [run_id])?;
+            checks::start(conn, run_id, &delivery.pr.head_sha, &[])
+        })
+        .await
+        .unwrap();
+        let (_, _, body) = send(&app, get("/cards/1/activity")).await;
+        assert!(body.contains("Non exécutées"));
+        assert!(body.contains("/pull-request/merge"), "{body}");
+
+        db.call(move |conn| {
+            conn.execute(
+                "UPDATE card_pull_requests SET error = '<remote> unavailable' WHERE card_id = 1",
+                [],
+            )?;
+            Ok::<_, StoreError>(())
+        })
+        .await
+        .unwrap();
+        let (_, _, body) = send(&app, get("/cards/1/activity")).await;
+        assert!(!body.contains("/pull-request/merge"));
+        assert!(body.contains("/pull-request/publish"));
+        assert!(!body.contains("<remote>"));
+
+        db.call(move |conn| {
+            let mut delivery = delivery::get(conn, 1)?.unwrap();
+            delivery.pr.head_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
+            delivery::record(conn, 1, run_id, &delivery.repository, &delivery.pr)
+        })
+        .await
+        .unwrap();
+        let (_, _, body) = send(&app, get("/cards/1/activity")).await;
+        assert!(!body.contains("/pull-request/merge"));
+
+        post_form(&app, "/cards/1/move", "column_id=1&position=0").await;
+        post_form(&app, "/cards/1/move", "column_id=2&position=0").await;
+        let (_, _, body) = send(&app, get("/cards/1/activity")).await;
+        assert!(body.contains("exécution précédente"));
+        assert!(!body.contains("/pull-request/merge"));
+        assert!(!body.contains("/pull-request/publish"));
+        assert!(body.contains("Aucun résultat de vérification"));
+        for action in ["publish", "refresh", "merge"] {
+            let uri = format!("/cards/1/pull-request/{action}");
+            assert_eq!(post_form(&app, &uri, "").await, StatusCode::CONFLICT);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retargeted_pull_request_does_not_offer_merge() {
+        let db = Db::open_in_memory().unwrap();
+        let app = delivery_app(&db);
+        post_form(&app, "/cards", "column_id=2&title=Task&agent=claude").await;
+        let run_id = store_verified_pull_request(&db).await;
+        db.call(move |conn| {
+            let mut saved = delivery::get(conn, 1)?.unwrap();
+            saved.pr.base_branch = "other-base".to_owned();
+            delivery::record(conn, 1, run_id, &saved.repository, &saved.pr)
+        })
+        .await
+        .unwrap();
+        let (_, _, body) = send(&app, get("/cards/1/activity")).await;
+        assert!(!body.contains("/pull-request/merge"), "{body}");
+        assert!(body.contains("/pull-request/refresh"));
+    }
+
+    #[tokio::test]
+    async fn delivery_posts_redirect_without_javascript_and_report_remote_errors() {
+        let root =
+            std::env::temp_dir().join(format!("helm-routes-delivery-{}", std::process::id()));
+        let repo = root.join("repo");
+        let remote = root.join("repo.gh");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&remote).unwrap();
+        let mut snapshot = serde_json::json!({
+            "number": 17,
+            "url": "https://github.com/owner/repo/pull/17",
+            "state": "OPEN",
+            "isDraft": false,
+            "headRefOid": "1234567890123456789012345678901234567890",
+            "headRefName": "helm/HELM-1",
+            "baseRefName": "main",
+            "statusCheckRollup": [],
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "reviewDecision": "APPROVED",
+            "isCrossRepository": false,
+        });
+        std::fs::write(remote.join("view.json"), snapshot.to_string()).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let app = delivery_app_with_config(
+            &db,
+            repo,
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-gh.sh"),
+        );
+        post_form(&app, "/cards", "column_id=2&title=Task&agent=claude").await;
+        store_verified_pull_request(&db).await;
+
+        let uri = "/cards/1/pull-request/refresh";
+        let (status, headers, _) = send(&app, post(uri).body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(headers[header::LOCATION], "/cards/1/edit#run-activity");
+        assert_eq!(post_form(&app, uri, "").await, StatusCode::NO_CONTENT);
+
+        std::fs::write(remote.join("view.exit"), "1").unwrap();
+        std::fs::write(remote.join("view.stderr"), "GitHub indisponible").unwrap();
+        let (status, _, body) = send(&app, post(uri).body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body.contains("GitHub indisponible"), "{body}");
+        std::fs::remove_file(remote.join("view.exit")).unwrap();
+        std::fs::remove_file(remote.join("view.stderr")).unwrap();
+
+        snapshot["state"] = serde_json::Value::String("MERGED".to_owned());
+        std::fs::write(remote.join("after-merge.json"), snapshot.to_string()).unwrap();
+        let (status, headers, _) = send(
+            &app,
+            post("/cards/1/pull-request/merge")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(headers[header::LOCATION], "/cards/1/edit#run-activity");
+        let saved = db
+            .call(|conn| delivery::get(conn, 1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.pr.state, crate::github::PullRequestState::Merged);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

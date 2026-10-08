@@ -4,10 +4,14 @@ mod adapter;
 mod agent;
 mod assets;
 mod changes;
+mod checks;
 mod config;
 mod db;
+mod delivery;
 mod git;
+mod github;
 mod mentions;
+mod process;
 mod prompt;
 mod routes;
 mod runs;
@@ -88,6 +92,14 @@ async fn serve(config: &Config, db: Db) -> Result<(), Box<dyn Error>> {
         orchestrator.clone(),
     );
     let changes = state.changes();
+    let delivery = delivery::Delivery::new(
+        db.clone(),
+        changes.clone(),
+        gate,
+        config.project.as_ref().map(|project| project.repo.clone()),
+        config.github.clone(),
+    );
+    let state = state.with_delivery(delivery.clone());
 
     // Bind before recovery: a second instance on the same address must not interrupt
     // the runs still supervised by the instance that already owns the listener.
@@ -131,8 +143,10 @@ async fn serve(config: &Config, db: Db) -> Result<(), Box<dyn Error>> {
                     worktree_root: project.worktree_root.clone(),
                     max_concurrent: config.agents.max_concurrent,
                     run_timeout: config.agents.run_timeout,
+                    checks: config.checks.clone(),
                 },
-            );
+            )
+            .with_delivery(delivery.clone());
             Some(tokio::spawn(Arc::new(supervisor).run()))
         }
         _ => {
@@ -142,12 +156,14 @@ async fn serve(config: &Config, db: Db) -> Result<(), Box<dyn Error>> {
             None
         }
     };
+    let delivery_poll = tokio::spawn(delivery.poll());
     // Open SSE streams never finish on their own, so stop serving as soon as a signal
     // arrives instead of waiting for connections to drain.
     tokio::select! {
         result = axum::serve(listener, routes::router(state)) => result?,
         () = shutdown_signal() => eprintln!("helm: shutting down"),
     }
+    delivery_poll.abort();
     stopper.shutdown().await;
     Ok(())
 }

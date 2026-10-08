@@ -277,6 +277,29 @@ pub async fn has_uncommitted_changes(worktree: &Path) -> Result<bool> {
     Ok(!git(worktree, &["status", "--porcelain"]).await?.is_empty())
 }
 
+/// The commit on the expected branch. Checks and PRs must never silently switch branches.
+pub async fn checked_head(worktree: &Path, branch: &str, require_clean: bool) -> Result<String> {
+    let current = git(worktree, &["symbolic-ref", "--short", "HEAD"]).await?;
+    if current != branch {
+        return error(format!("expected branch {branch}, found {current}"));
+    }
+    if require_clean && has_uncommitted_changes(worktree).await? {
+        return error("des modifications non commitées restent dans le worktree");
+    }
+    git(worktree, &["rev-parse", "--verify", "HEAD^{commit}"]).await
+}
+
+/// Push the exact checked commit, even if a hook or another process moves the local ref.
+pub async fn push_commit(worktree: &Path, branch: &str, commit: &str) -> Result<()> {
+    if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return error("invalid commit object id");
+    }
+    let refspec = format!("{commit}:refs/heads/{branch}");
+    with_remote_timeout("git push", git(worktree, &["push", "origin", &refspec]))
+        .await
+        .map(drop)
+}
+
 /// Pushes the branch to `origin`. Never forced: a rejected push is a failed run.
 pub async fn push(worktree: &Path, branch: &str) -> Result<()> {
     let args = ["push", "--set-upstream", "origin", branch];

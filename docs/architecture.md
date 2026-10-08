@@ -5,8 +5,8 @@ Helm est un tableau kanban auto-hébergé pour un développeur solo, dans l'espr
 des CLI (`claude -p`, `codex exec`) ; le tableau est à la fois l'outil de suivi et le bus par
 lequel ils se coordonnent.
 
-Ce document décrit ce qui existe (le kanban et ses commentaires) et la conception de ce qui
-vient (l'orchestrateur). Chaque section précise son état : **livré** ou **prévu**.
+Ce document décrit le kanban, ses commentaires, l'orchestration de Claude, les vérifications
+locales et les PR GitHub. Les éléments de conception non livrés sont indiqués comme **prévus**.
 
 ## 1. Principes
 
@@ -42,8 +42,12 @@ navigateur ──HTTP──▶ axum (routes.rs) ──▶ store.rs ──▶ SQL
 | `runs.rs`       | Exécutions d'agent : machine à états, journal d'événements, opérations de stockage. |
 | `agent.rs`      | Vocabulaire commun : agent, modèle, mode de permission.                     |
 | `adapter.rs`    | `AgentAdapter` : ligne de commande d'un CLI et lecture de son flux (`ClaudeAdapter`). |
-| `supervisor.rs` | `Orchestrator` (mise en file, annulation) et `Supervisor` (processus, worktree, push). |
+| `supervisor.rs` | `Orchestrator` (mise en file, annulation) et `Supervisor` (processus, worktree, vérifications, push, publication de PR). |
 | `git.rs`        | Worktrees, comptage de commits et push, par appel au binaire `git`.         |
+| `checks.rs`     | Exécution des commandes locales et stockage de leurs résultats par commit et exécution. |
+| `process.rs`    | Commandes externes avec délai maximal, sorties bornées et arrêt du groupe de processus. |
+| `github.rs`     | Client du CLI `gh` : création, actualisation et fusion de PR sur github.com. |
+| `delivery.rs`   | Publication du commit vérifié, instantanés GitHub, réservation par carte et passage automatique à Terminé. |
 | `prompt.rs`     | Consigne envoyée à l'agent, construite depuis la carte et son fil.          |
 | `changes.rs`    | Notification « le tableau a changé », partagée par les routes et le superviseur. |
 | `assets.rs`     | Fichiers statiques embarqués (`rust-embed`), revalidés par ETag.            |
@@ -94,6 +98,9 @@ converge donc toujours, au prix d'un rendu complet du tableau — négligeable �
 Un commentaire publie le même événement : le compteur de la carte se met à jour avec le
 tableau, et le dialogue ouvert recharge seulement le fil (`GET /cards/{id}/comments`), jamais le
 formulaire, pour ne pas écraser un brouillon en cours de saisie.
+Les changements de vérification ou de PR publient aussi ce signal. Le dialogue recharge alors
+le panneau d'activité depuis les résultats et l'instantané conservés en base. Lire une page ou
+un fragment ne lance aucune commande GitHub et ne modifie pas la base.
 
 ### Sécurité du mode local
 
@@ -113,8 +120,10 @@ par défaut est `bypassPermissions`). **Helm refuse donc de lancer la moindre ex
 n'écoute pas sur loopback** (`RunGate::NotLoopback`) : l'avertissement au démarrage, un bandeau
 sur le tableau et une note dans le formulaire de carte le disent, et aucune exécution n'est mise
 en file. Sans dépôt configuré (`RunGate::NoRepo`), l'assignation d'un agent est refusée. Les
-routes d'écriture de l'orchestrateur (`POST /runs/{id}/cancel`) passent par le même garde
-`Origin` / `Sec-Fetch-Site` que les autres.
+routes d'annulation et de publication, d'actualisation ou de fusion des PR passent par le même
+garde `Origin` / `Sec-Fetch-Site` que les autres. L'intégration GitHub exige elle aussi un dépôt
+configuré et une écoute sur loopback. Les vérifications sont des commandes locales exécutées
+avec les droits du processus Helm.
 
 ## 3. Modèle de données
 
@@ -196,6 +205,24 @@ projects 1──* board_columns 1──* cards *──* labels
   `notice`, `error`, `malformed`), `summary` (la ligne affichée sur la carte), `payload` (ligne
   JSON brute du CLI, intacte), `created_at`. C'est le fil d'activité affiché sur la carte.
 
+### Livré avec les vérifications et GitHub (migration `0005_delivery`)
+
+- `run_verifications` contient un résultat global par `run_id`, lié à `commit_sha`.
+  Les états sont `running`, `passed`, `failed`, `skipped` et `interrupted`.
+  L'absence de commandes produit `skipped`, affiché « Non exécutées ».
+- `run_checks` contient chaque commande dans son ordre d'exécution : `run_id`, `position`,
+  `command`, `status`, `stdout`, `stderr`, `exit_code` et `error`. Les états sont `pending`,
+  `running`, `passed`, `failed` et `interrupted`. Un contrôle réussi exige un code de retour nul.
+  Après un échec, les commandes restantes restent en attente et ne sont pas exécutées.
+- `card_pull_requests` conserve un instantané par carte : `card_id`, `run_id`, `repository`,
+  `number`, `expected_base`, `snapshot` JSON, `refreshed_at` et `error`. Le couple dépôt et
+  numéro de PR est unique. L'instantané contient l'état, le commit, les branches, les contrôles
+  CI et les conditions de fusion renvoyés par GitHub. Une actualisation conserve la base
+  attendue. Si la lecture de GitHub échoue, Helm garde le dernier instantané et enregistre l'erreur.
+
+Les résultats disparaissent en cascade avec l'exécution ou la carte. Une PR peut rester liée
+à une exécution précédente après une relance : l'interface l'indique et bloque sa fusion.
+
 ### Prévu (migrations suivantes)
 
 - **`cards.parent_id`** — sous-cartes : un agent découpe son travail ou délègue en créant des
@@ -219,8 +246,10 @@ projects 1──* board_columns 1──* cards *──* labels
 **Livré.** Une carte naît en bas d'une colonne (ajout rapide, titre seul), s'enrichit dans le
 dialogue d'édition (description, priorité, étiquettes, colonne) et se déplace librement :
 glisser-déposer, `Alt` + flèches au clavier, ou liste « Colonne » du formulaire. Aucune
-transition n'est interdite — c'est l'outil d'une seule personne. Le dialogue d'édition porte
-aussi le fil de commentaires de la carte et un formulaire pour en ajouter (auteur `moi`). La suppression est définitive
+transition de colonne n'est interdite. Pendant une opération GitHub, modifier, déplacer ou
+supprimer la carte est temporairement refusé pour éviter une course avec la livraison.
+Le dialogue d'édition porte aussi le fil de commentaires de la carte et un formulaire pour
+en ajouter (auteur `moi`). La suppression est définitive
 (confirmation dans le dialogue, ou page de confirmation sans JavaScript).
 
 **Livré, avec l'orchestrateur.** Les colonnes gardent leur liberté pour l'humain, mais leur
@@ -234,13 +263,16 @@ catégorie déclenche et reflète le travail des agents :
 | `in_progress` (reste)              | orchestrateur      | Échec, annulation ou interruption : la carte ne bouge pas, l'erreur est dans l'activité de la carte et dans son fil (commentaire du système, qui n'enregistre jamais de mention). |
 | `in_review` → `todo`               | humain             | Nouvelle exécution (la reprise de session viendra ensuite). |
 | `in_review` → `done`               | humain             | Travail accepté ; le worktree peut être nettoyé (à la main pour l'instant). |
+| carte → `done`                     | livraison GitHub   | GitHub confirme la fusion de la PR de la dernière exécution, en état `succeeded`, avec le commit vérifié et les branches attendues. |
 
 Seule l'*entrée* dans une colonne `todo` déclenche : enregistrer le formulaire d'une carte déjà
 là, ou la réordonner dans la colonne, ne relance rien.
 
-Un agent ne déplace jamais une carte vers `done` : la revue reste humaine.
+L'agent ne décide pas de la fusion. L'humain la demande dans Helm ou sur GitHub, puis Helm
+actualise la carte après confirmation. Déplacer manuellement une carte vers `done` reste
+possible et ne déclenche aucune fusion.
 
-## 5. Orchestrateur (première tranche livrée)
+## 5. Orchestrateur (livré)
 
 ### Modèle d'exécution
 
@@ -259,7 +291,7 @@ codex exec --json "<consigne>"                          # prévu ; reprise : cod
   `main`, `master`, ou la branche extraite) ; le processus y est lancé (`cwd`), dans son propre
   groupe de processus, tué en entier à l'annulation. Les agents ne se marchent pas
   dessus et le dépôt principal reste intact. Le worktree survit à l'exécution (revue, reprise)
-  et n'est supprimé qu'une fois la carte terminée ou archivée.
+  et son nettoyage reste manuel.
 - **Événements structurés sur la carte.** La sortie standard est lue ligne à ligne (un objet
   JSON par ligne), normalisée par un adaptateur propre à chaque CLI, puis insérée dans
   `agent_events`. Chaque insertion publie un événement SSE : la carte affiche l'activité en
@@ -267,7 +299,7 @@ codex exec --json "<consigne>"                          # prévu ; reprise : cod
   conservée à part pour le diagnostic (`agent_runs.stderr`, 256 Kio au plus). Une ligne de plus
   de 1 Mio est tronquée à la lecture et signalée dans le journal, sans interrompre l'exécution. Les nouvelles
   lignes sont annoncées aux navigateurs au plus quatre fois par seconde par exécution.
-- **Reprise par identifiant de session.** Le `session_id` émis par le CLI est enregistré dès
+- **Reprise par identifiant de session, prévue.** Le `session_id` émis par le CLI est enregistré dès
   qu'il apparaît. Relancer après des retours de revue, un échec ou un redémarrage de Helm
   crée une **nouvelle** exécution (`resumed_from`) qui reprend la même session dans le même
   worktree : le contexte de l'agent est conservé, l'historique des tentatives aussi.
@@ -288,19 +320,78 @@ codex exec --json "<consigne>"                          # prévu ; reprise : cod
 - **Fin de travail : pousser la branche.** Après un succès de l'agent, Helm demande à
   `origin` où en est la branche (`git ls-remote`, jamais la copie locale `origin/<branche>`, qui peut
   être périmée) et la compare au worktree. Si la branche porte des commits que `origin` n'a pas,
-  qu'ils viennent de cette exécution ou d'une précédente restée sans push, Helm exécute
-  `git push --set-upstream origin helm/<clé>-<n>`, jamais forcé. Si `origin` a déjà tout (ou n'a pas
+  qu'ils viennent de cette exécution ou d'une précédente restée sans push, Helm les pousse
+  vers `origin`, sans forcer. Si `origin` a déjà tout (ou n'a pas
   la branche et que le worktree n'ajoute rien à la branche par défaut), l'exécution échoue : « rien à
   pousser ». Si `origin` a des commits que le worktree n'a pas (historique réécrit, travail poussé
-  d'ailleurs), elle échoue aussi, sans push. `origin` injoignable : elle échoue. Aucune PR n'est ouverte. Un
-  push refusé ou impossible fait échouer l'exécution : la base refuse un `succeeded` sans `pushed_at`. Les modifications non commitées laissées par
-  l'agent restent dans le worktree et sont signalées dans le journal.
+  d'ailleurs), elle échoue aussi, sans push. `origin` injoignable : elle échoue. Un push refusé
+  ou impossible fait échouer l'exécution : la base refuse un `succeeded` sans `pushed_at`.
+  Avec des vérifications configurées ou GitHub activé, Helm pousse le SHA vérifié exact et
+  exige un worktree propre. Sans ces options, les modifications non commitées restent dans
+  le worktree et sont signalées dans le journal, comme auparavant.
 
 Un trait `AgentAdapter` isole ce qui diffère entre CLI : construire la commande (lancement et
 reprise), reconnaître l'identifiant de session, traduire chaque ligne en événement normalisé,
 détecter la fin et son issue. Ajouter un agent, c'est écrire un adaptateur.
 
-### tmux : optionnel, pour regarder et reprendre la main
+### Vérifications locales avant publication
+
+`[checks]` configure une liste `commands` et un `timeout_minutes`, de 10 minutes par commande
+par défaut. Après le succès de l'agent, `checks::execute` passe chaque chaîne à `sh -c` dans le
+worktree. Les commandes s'exécutent dans l'ordre. Un échec ou un timeout bloque les suivantes
+et le push. L'annulation ou l'arrêt de Helm interrompt les contrôles encore actifs.
+
+Avec des commandes ou GitHub activé, Helm vérifie la branche attendue, la propreté du worktree
+et le SHA avant les contrôles, après eux et juste avant le push. Le résultat global ne devient
+`passed` que si toutes les commandes réussissent sans changement du commit ni des fichiers.
+Sans commande, il reste `skipped`, même si Helm a validé le commit et la propreté pour GitHub.
+
+`process::capture` limite séparément stdout et stderr à 1 Mio et signale une troncature.
+Chaque commande a son propre groupe de processus. Un dépassement de délai ou une annulation
+arrête le groupe pour ne pas laisser de commande enfant continuer les vérifications.
+
+### Publication et fusion des PR GitHub
+
+Sans `[github]`, l'intégration est désactivée. `github.repository` désigne `owner/repo` sur
+github.com. `github.command` vaut `gh` par défaut ; ce CLI doit être installé et authentifié
+par l'utilisateur. Les appels précisent le dépôt et l'hôte, avec un délai de 120 secondes par
+commande. La configuration et un exemple figurent dans le [README](../README.md).
+
+Après un push réussi, `Delivery::publish` crée ou retrouve la PR ouverte correspondant aux
+branches attendues. Une PR en brouillon devient prête à relire. La base vient de la résolution
+de la branche par défaut du dépôt dans `git.rs`. Lors de la création, le corps transmis sur
+stdin indique le SHA et les résultats de Helm. Une PR réutilisée conserve son corps existant.
+L'identité et l'URL de la PR sont validées avant stockage.
+
+Une erreur ou une annulation pendant la publication de la PR ne remet pas en cause le push
+réussi. L'exécution se termine en `succeeded`, avec un commentaire expliquant le problème.
+`Delivery::retry` republie le SHA enregistré dans les vérifications de la dernière exécution,
+qui doit être réussie, sans relancer l'agent ni les commandes. Le bouton « Créer la PR / Réessayer » appelle
+cette opération.
+
+Les opérations GitHub et la mise en file partagent une réservation par carte. Une exécution
+active bloque l'actualisation et la fusion manuelles. Une livraison déjà en cours bloque une
+autre livraison et les modifications de la carte, afin qu'une fusion ne vise pas une exécution
+remplacée entre-temps.
+
+`Delivery::merge` relit GitHub et exige une dernière exécution en état `succeeded`, des vérifications
+`passed` ou `skipped`, le même SHA, la même branche et la base attendue. Le client refuse les
+brouillons, les CI en cours, échouées ou inconnues, les revues bloquantes et les états dont
+GitHub ne confirme pas la fusion possible. Une liste vide de contrôles CI est « Aucun contrôle »,
+distincte de « Réussis » ; elle n'est pas bloquante à elle seule.
+
+La fusion passe par `gh pr merge --squash --match-head-commit <SHA>`, sans contournement
+administrateur. Un code de retour nul ne suffit pas : une nouvelle lecture doit confirmer
+`MERGED`, le commit et la base attendus. Helm passe alors la carte à `done` seulement si la PR
+correspond toujours à la dernière exécution de la carte, qui doit être réussie, à son commit
+vérifié et à sa branche.
+
+L'actualisation manuelle et la boucle d'arrière-plan, cadencée toutes les 30 secondes,
+reconnaissent aussi les fusions faites directement sur GitHub. La boucle traite séquentiellement
+les cartes non terminées. Si la lecture de GitHub échoue, Helm conserve le dernier instantané
+et enregistre l'erreur.
+
+### tmux : prévu, pour regarder et reprendre la main
 
 Le mode sans interface est la règle. tmux n'est qu'une **option par carte**, pour le cas où
 l'humain veut voir l'agent travailler ou intervenir : l'orchestrateur lance alors le CLI
@@ -345,6 +436,12 @@ conversation, et remplacer un agent par un autre ne change pas le protocole.
   fragment ; le script le recharge à chaque événement SSE sans toucher au formulaire. Sans
   JavaScript, la page de la carte porte le même panneau et le bouton d'annulation est un
   formulaire.
+- **Vérifications et PR.** Le même panneau affiche le commit vérifié, chaque commande et ses
+  sorties, le lien de PR, son état, la CI et la dernière actualisation. Les actions sont des
+  POST sous `/cards/{id}/pull-request/`, avec les suffixes `publish`, `refresh` et `merge`. Le serveur valide
+  l'état au moment de l'action ; le bouton de fusion est masqué si l'instantané ne l'autorise
+  pas. Sans JavaScript, une action réussie redirige vers la carte ; avec le script, elle
+  renvoie `204` et le panneau est rechargé.
 - **Sans JavaScript**, créer, modifier, déplacer (liste « Colonne »), supprimer et commenter
   restent possibles par envoi de formulaire classique. Les heures des commentaires sont alors
   affichées en UTC ; le script les convertit dans le fuseau du navigateur.
@@ -365,8 +462,9 @@ conversation, et remplacer un agent par un autre ne change pas le protocole.
    automatique pour l'instant).
 5. **Assignation** — un agent par carte, choisi par l'humain (champ du formulaire). Reste
    ouvert : plusieurs rôles (auteur, relecteur) et les règles de projet.
-6. **Fin de travail** — décidé : l'agent s'arrête au commit, Helm pousse la branche et n'ouvre
-   pas de PR.
+6. **Fin de travail** : livré. L'agent s'arrête au commit. Helm exécute les contrôles configurés,
+   pousse la branche et publie une PR si GitHub est activé. La fusion est explicite et la
+   confirmation GitHub conditionne le passage automatique à Terminé.
 7. **Rétention des événements** — les flux `stream-json` sont volumineux : tout garder,
    compacter après N jours, ou ne conserver que les événements significatifs ?
 8. **Budget** — plafond de coût ou de durée par exécution, et comportement à l'atteinte.

@@ -1,25 +1,41 @@
-# Copy to `helm.toml` (or point HELM_CONFIG at it). Every key is optional.
-# Environment variables win over this file: HELM_BIND, HELM_DB.
+# Copiez ce fichier vers `helm.toml`, ou désignez-le avec HELM_CONFIG.
+# Les sections optionnelles sont commentées. HELM_BIND et HELM_DB priment sur ce fichier.
 
-# Address to listen on. Keep it on loopback unless you put a trusted proxy/VPN in front.
+# Adresse d'écoute. Les agents et GitHub exigent une adresse loopback.
 bind = "127.0.0.1:7878"
 
-# SQLite database file (created on first start, WAL mode).
+# Base SQLite créée au premier démarrage, en mode WAL.
 db_path = "helm.db"
 
-# --- Agents ---------------------------------------------------------------------------
-# Without `project.repo` the board works as a plain kanban and agents cannot be assigned.
-# Runs also need a loopback `bind`: Helm has no authentication, and a run executes code.
-#
+# Sans `project.repo`, le tableau fonctionne sans assignation d'agent.
+# Les chemins du dépôt et des worktrees sont absolus ou commencent par ~/.
 # [project]
-# repo = "~/code/my-project"                          # git repository cards are worked on in; absolute or ~/…
-# worktree_root = "~/.local/share/helm/worktrees"     # one worktree per card: <root>/<KEY>-<n>
+# repo = "~/code/my-project"
+# worktree_root = "~/.local/share/helm/worktrees" # <racine>/<CLÉ>-<n> par carte
 #
 # [agents]
-# max_concurrent = 2                                  # runs in flight at once
-# run_timeout_minutes = 60                            # an agent still running after this is stopped; the run fails
+# max_concurrent = 2
+# run_timeout_minutes = 60 # limite de l'agent, distincte de celle des vérifications
 #
 # [agents.claude]
-# command = "claude"                                  # executable, looked up on PATH
-# permission_mode = "bypassPermissions"               # acceptEdits | auto | bypassPermissions | manual | dontAsk | plan
-# model = "sonnet"                                    # default for cards that name no model
+# command = "claude" # exécutable trouvé dans PATH
+# permission_mode = "bypassPermissions" # acceptEdits | auto | bypassPermissions | manual | dontAsk | plan
+# model = "sonnet" # modèle des cartes qui n'en nomment pas
+
+# Vérifications après l'agent, avant le push, dans le worktree de la carte.
+# Chaque chaîne passe à sh -c, avec les droits de Helm. Adaptez ces commandes au projet.
+# Un échec bloque le push. Aucune commande signifie « Non exécutées ».
+# [checks]
+# commands = [
+#     "cargo fmt --check",
+#     "cargo clippy --all-targets --locked -- -D warnings",
+#     "cargo test --locked",
+# ]
+# timeout_minutes = 10 # par commande, entier strictement positif
+
+# Sans cette section, Helm n'ouvre pas de PR.
+# Installez gh et authentifiez-le sur github.com avant de l'activer.
+# Le dépôt doit correspondre au remote origin de project.repo.
+# [github]
+# repository = "owner/repo"
+# command = "gh" # défaut : gh dans PATH ; un chemin d'exécutable est aussi accepté

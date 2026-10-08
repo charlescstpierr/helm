@@ -24,8 +24,11 @@ use tokio::sync::{Notify, Semaphore};
 use crate::adapter::{self, AgentAdapter, Finish, Launch, ParsedLine, Verdict};
 use crate::agent::{Agent, ModelName, PermissionMode};
 use crate::changes::Changes;
+use crate::checks::{self, VerificationStatus};
+use crate::config::ChecksConfig;
 use crate::config::RunGate;
 use crate::db::Db;
+use crate::delivery::{Delivery, OperationLocks};
 use crate::git;
 use crate::prompt;
 use crate::runs::{self, EventKind, NewEvent, NewRun, Outcome, Run, RunId, RunStatus};
@@ -53,6 +56,7 @@ struct Shared {
     /// One handle per running run, inserted when the run is claimed and removed when it ends.
     cancels: Mutex<HashMap<RunId, Arc<Notify>>>,
     stopping: AtomicBool,
+    delivery_locks: Mutex<Option<OperationLocks>>,
 }
 
 /// The HTTP side: queues and cancels. Cheap to clone.
@@ -70,12 +74,30 @@ impl Orchestrator {
                 wake: Notify::new(),
                 cancels: Mutex::new(HashMap::new()),
                 stopping: AtomicBool::new(false),
+                delivery_locks: Mutex::new(None),
             }),
         }
     }
 
     pub fn gate(&self) -> RunGate {
         self.shared.gate
+    }
+
+    pub fn set_delivery_locks(&self, locks: OperationLocks) {
+        *lock(&self.shared.delivery_locks) = Some(locks);
+    }
+
+    pub fn ensure_card_available(&self, card_id: i64) -> Result<(), StoreError> {
+        if lock(&self.shared.delivery_locks)
+            .as_ref()
+            .is_some_and(|locks| locks.contains(card_id))
+        {
+            return Err(StoreError::Invalid(
+                "Une opération GitHub est en cours sur cette carte. Réessayez dans un instant."
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn default_model(&self) -> Option<&ModelName> {
@@ -101,6 +123,7 @@ impl Orchestrator {
         card_id: i64,
         entered_column: bool,
     ) -> Result<(), StoreError> {
+        self.ensure_card_available(card_id)?;
         if store::card_category(conn, card_id)? != Category::Todo {
             runs::cancel_queued(conn, card_id)?;
             return Ok(());
@@ -234,6 +257,7 @@ const STOPPED_BY_SHUTDOWN: &str = "Helm s'est arrêté pendant l'exécution.";
 pub async fn recover(db: &Db, changes: &Changes) -> Result<usize, StoreError> {
     let count = db
         .call(|conn| {
+            checks::interrupt_unfinished(conn)?;
             let orphans = runs::running_runs(conn)?;
             for orphan in &orphans {
                 let still_alive = orphan.pid.is_some_and(group_exists);
@@ -406,6 +430,7 @@ pub struct SupervisorConfig {
     pub worktree_root: PathBuf,
     pub max_concurrent: usize,
     pub run_timeout: Duration,
+    pub checks: ChecksConfig,
 }
 
 /// The background task: claims queued runs, up to the concurrency limit, and drives them.
@@ -415,6 +440,7 @@ pub struct Supervisor {
     adapter: Arc<dyn AgentAdapter>,
     changes: Changes,
     config: SupervisorConfig,
+    delivery: Option<Delivery>,
 }
 
 impl Supervisor {
@@ -431,7 +457,14 @@ impl Supervisor {
             adapter,
             changes,
             config,
+            delivery: None,
         }
+    }
+
+    pub fn with_delivery(mut self, delivery: Delivery) -> Self {
+        self.orchestrator.set_delivery_locks(delivery.locks());
+        self.delivery = Some(delivery);
+        self
     }
 
     /// Never returns; abort the task to stop it.
@@ -761,6 +794,10 @@ impl Supervisor {
         worktree: &git::Worktree,
         cancel: &Notify,
     ) -> Outcome {
+        let head = match self.verify(id, worktree, cancel).await {
+            Ok(head) => head,
+            Err(outcome) => return outcome,
+        };
         let branch = &worktree.branch;
         let pending = unless_cancelled(cancel, git::unpublished(&self.config.repo, worktree)).await;
         match pending {
@@ -817,7 +854,20 @@ impl Supervisor {
             format!("Push de {} vers origin.", worktree.branch),
         )
         .await;
-        match unless_cancelled(cancel, git::push(&worktree.path, &worktree.branch)).await {
+        let strict = !self.config.checks.commands.is_empty()
+            || self.delivery.as_ref().is_some_and(Delivery::enabled);
+        match git::checked_head(&worktree.path, branch, strict).await {
+            Ok(current) if current == head => {}
+            _ => return self.fail(id, "Le commit ou les fichiers ont changé depuis les vérifications : rien n'est poussé.".to_owned()).await,
+        }
+        let pushing = async {
+            if strict {
+                git::push_commit(&worktree.path, &worktree.branch, &head).await
+            } else {
+                git::push(&worktree.path, &worktree.branch).await
+            }
+        };
+        match unless_cancelled(cancel, pushing).await {
             None => self.stopped(),
             Some(Err(e)) => self.fail(id, format!("git push a échoué : {e}")).await,
             Some(Ok(())) => {
@@ -827,9 +877,159 @@ impl Supervisor {
                     format!("{} poussée sur origin.", worktree.branch),
                 )
                 .await;
+                if let Some(delivery) = &self.delivery {
+                    if delivery.enabled() {
+                        // The agent, checks and push are complete. An interrupted GitHub
+                        // request must leave this delivery retryable without rerunning code.
+                        let publication = unless_cancelled(cancel, delivery.publish(id, &head))
+                            .await
+                            .unwrap_or_else(|| Err("Publication GitHub interrompue.".to_owned()));
+                        if let Err(error) = publication {
+                            let message = format!(
+                                "La branche est poussée, mais la PR n'a pas pu être créée : {error} Utilisez « Créer la PR » sur la carte pour réessayer."
+                            );
+                            self.note(id, EventKind::Error, message.clone()).await;
+                            let _ = self
+                                .db
+                                .call(move |conn| {
+                                    let run = runs::get_run(conn, id)?;
+                                    comment(conn, run.card_id, message)
+                                })
+                                .await;
+                        }
+                    }
+                }
                 Outcome::Succeeded
             }
         }
+    }
+
+    async fn verify(
+        &self,
+        id: RunId,
+        worktree: &git::Worktree,
+        cancel: &Notify,
+    ) -> Result<String, Outcome> {
+        let strict = !self.config.checks.commands.is_empty()
+            || self.delivery.as_ref().is_some_and(Delivery::enabled);
+        let head = match unless_cancelled(
+            cancel,
+            git::checked_head(&worktree.path, &worktree.branch, strict),
+        )
+        .await
+        {
+            None => return Err(self.stopped()),
+            Some(Err(error)) => {
+                return Err(self
+                    .fail(id, format!("Vérification impossible : {error}"))
+                    .await);
+            }
+            Some(Ok(head)) => head,
+        };
+        let (commit, commands) = (head.clone(), self.config.checks.commands.clone());
+        if let Err(error) = self
+            .db
+            .call(move |conn| checks::start(conn, id, &commit, &commands))
+            .await
+        {
+            return Err(self
+                .fail(id, format!("Vérifications non enregistrées : {error}"))
+                .await);
+        }
+        self.changes.publish();
+        for (position, command) in self.config.checks.commands.iter().enumerate() {
+            let position = position as i64;
+            if let Err(error) = self
+                .db
+                .call(move |conn| checks::start_check(conn, id, position))
+                .await
+            {
+                return Err(self
+                    .fail(id, format!("Vérification non démarrée : {error}"))
+                    .await);
+            }
+            self.changes.publish();
+            self.note(id, EventKind::Notice, format!("Vérification : {command}"))
+                .await;
+            let output = match unless_cancelled(
+                cancel,
+                checks::execute(command, &worktree.path, self.config.checks.timeout),
+            )
+            .await
+            {
+                None => return Err(self.stopped()),
+                Some(Ok(output)) => output,
+                Some(Err(error)) => crate::process::CommandOutput {
+                    stdout: String::new(),
+                    stderr: error,
+                    exit_code: None,
+                    timed_out: false,
+                },
+            };
+            let success = output.success();
+            if let Err(error) = self
+                .db
+                .call(move |conn| checks::finish_check(conn, id, position, &output))
+                .await
+            {
+                return Err(self
+                    .fail(
+                        id,
+                        format!("Résultat de vérification non enregistré : {error}"),
+                    )
+                    .await);
+            }
+            self.changes.publish();
+            if !success {
+                let _ = self
+                    .db
+                    .call(move |conn| checks::finish(conn, id, VerificationStatus::Failed))
+                    .await;
+                return Err(self
+                    .fail(
+                        id,
+                        format!("La vérification `{command}` a échoué. Aucun commit n'est poussé."),
+                    )
+                    .await);
+            }
+        }
+        if strict {
+            match unless_cancelled(
+                cancel,
+                git::checked_head(&worktree.path, &worktree.branch, true),
+            )
+            .await
+            {
+                None => return Err(self.stopped()),
+                Some(Ok(after)) if after == head => {}
+                _ => {
+                    let _ = self
+                        .db
+                        .call(move |conn| checks::finish(conn, id, VerificationStatus::Failed))
+                        .await;
+                    return Err(self.fail(id, "Les vérifications ont modifié le commit ou les fichiers : rien n'est poussé.".to_owned()).await);
+                }
+            }
+        }
+        if !self.config.checks.commands.is_empty() {
+            if let Err(error) = self
+                .db
+                .call(move |conn| checks::finish(conn, id, VerificationStatus::Passed))
+                .await
+            {
+                return Err(self
+                    .fail(id, format!("Vérifications non enregistrées : {error}"))
+                    .await);
+            }
+            self.note(
+                id,
+                EventKind::Notice,
+                format!("Toutes les vérifications ont réussi sur {head}."),
+            )
+            .await;
+        }
+        self.changes.publish();
+        Ok(head)
     }
 
     fn stopped(&self) -> Outcome {
@@ -866,6 +1066,9 @@ impl Supervisor {
         let concluded = self
             .db
             .call(move |conn| {
+                if checks::get(conn, id)?.is_some() {
+                    checks::finish(conn, id, VerificationStatus::Interrupted)?;
+                }
                 runs::finish(conn, id, &outcome)?;
                 let run = runs::get_run(conn, id)?;
                 match &outcome {
@@ -967,6 +1170,7 @@ mod tests {
         orchestrator: Orchestrator,
         changes: Changes,
         limits: Limits,
+        checks: ChecksConfig,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -1012,6 +1216,7 @@ mod tests {
                 &orchestrator,
                 &changes,
                 limits,
+                ChecksConfig::default(),
             ));
             Self {
                 remote,
@@ -1019,6 +1224,7 @@ mod tests {
                 orchestrator,
                 changes,
                 limits,
+                checks: ChecksConfig::default(),
                 task,
             }
         }
@@ -1029,6 +1235,7 @@ mod tests {
             orchestrator: &Orchestrator,
             changes: &Changes,
             limits: Limits,
+            checks: ChecksConfig,
         ) -> impl Future<Output = ()> + use<> {
             let supervisor = Supervisor::new(
                 db.clone(),
@@ -1042,6 +1249,7 @@ mod tests {
                     worktree_root: remote.worktrees.clone(),
                     max_concurrent: limits.max_concurrent,
                     run_timeout: limits.run_timeout,
+                    checks,
                 },
             );
             Arc::new(supervisor).run()
@@ -1092,7 +1300,60 @@ mod tests {
                 &self.orchestrator,
                 &self.changes,
                 self.limits,
+                self.checks.clone(),
             ));
+        }
+
+        fn with_checks(name: &str, commands: &[&str], timeout: Duration) -> Self {
+            let mut harness = Self::new(name);
+            harness.checks = ChecksConfig {
+                commands: commands
+                    .iter()
+                    .map(|command| (*command).to_owned())
+                    .collect(),
+                timeout,
+            };
+            harness.restart();
+            harness
+        }
+
+        fn enable_github(&mut self) -> Delivery {
+            self.enable_github_command(PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake-gh.sh"
+            )))
+        }
+
+        fn enable_github_command(&mut self, command: PathBuf) -> Delivery {
+            self.task.abort();
+            let delivery = Delivery::new(
+                self.db.clone(),
+                self.changes.clone(),
+                RunGate::Open,
+                Some(self.remote.repo.clone()),
+                Some(crate::config::GithubConfig {
+                    repository: "owner/repo".to_owned(),
+                    command,
+                }),
+            );
+            let supervisor = Supervisor::new(
+                self.db.clone(),
+                self.orchestrator.clone(),
+                Arc::new(ClaudeAdapter {
+                    command: PathBuf::from(FAKE_CLAUDE),
+                }),
+                self.changes.clone(),
+                SupervisorConfig {
+                    repo: self.remote.repo.clone(),
+                    worktree_root: self.remote.worktrees.clone(),
+                    max_concurrent: self.limits.max_concurrent,
+                    run_timeout: self.limits.run_timeout,
+                    checks: self.checks.clone(),
+                },
+            )
+            .with_delivery(delivery.clone());
+            self.task = tokio::spawn(Arc::new(supervisor).run());
+            delivery
         }
 
         /// A card with the agent assigned, created straight in `À faire` so a run is queued.
@@ -1173,6 +1434,233 @@ mod tests {
         fn drop(&mut self) {
             self.task.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn passing_checks_are_recorded_against_the_pushed_commit() {
+        let h = Harness::with_checks(
+            "sup-checks-pass",
+            &["test -f HELLO.md", "printf checked"],
+            Duration::from_secs(2),
+        );
+        let card = h.card("success", "").await;
+        let run = h.settled(card).await;
+        assert_eq!(run.status, RunStatus::Succeeded, "{:?}", run.error);
+        let verification =
+            h.db.call(move |conn| checks::get(conn, run.id))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(verification.status, VerificationStatus::Passed);
+        assert_eq!(
+            verification.commit_sha,
+            git_run(&h.remote.origin, &["rev-parse", "helm/HELM-1"])
+        );
+        assert_eq!(verification.checks[1].stdout, "checked");
+        assert!(
+            verification
+                .checks
+                .iter()
+                .all(|check| check.exit_code == Some(0))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_check_stops_later_checks_and_never_pushes() {
+        let h = Harness::with_checks(
+            "sup-checks-fail",
+            &["printf failed >&2; exit 9", "touch should-not-run"],
+            Duration::from_secs(2),
+        );
+        let card = h.card("success", "").await;
+        let run = h.settled(card).await;
+        assert_eq!(run.status, RunStatus::Failed);
+        let verification =
+            h.db.call(move |conn| checks::get(conn, run.id))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(verification.status, VerificationStatus::Failed);
+        assert_eq!(verification.checks[0].exit_code, Some(9));
+        assert_eq!(verification.checks[0].stderr, "failed");
+        assert_eq!(verification.checks[1].status, checks::CheckStatus::Pending);
+        assert!(!h.remote.worktrees.join("HELM-1/should-not-run").exists());
+        assert!(
+            !git_run(&h.remote.origin, &["branch", "--list", "helm/HELM-1"])
+                .contains("helm/HELM-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn checks_that_change_the_tree_or_commit_cannot_publish_their_result() {
+        for (name, command) in [
+            ("sup-checks-dirty", "printf changed >> HELLO.md"),
+            (
+                "sup-checks-commit",
+                "git -c user.name=Test -c user.email=test@example.com commit --allow-empty -qm 'new commit'",
+            ),
+        ] {
+            let h = Harness::with_checks(name, &[command], Duration::from_secs(2));
+            let card = h.card("success", "").await;
+            let run = h.settled(card).await;
+            assert_eq!(run.status, RunStatus::Failed, "{name}");
+            assert!(run.error.unwrap().contains("modifié"));
+            let verification =
+                h.db.call(move |conn| checks::get(conn, run.id))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(verification.status, VerificationStatus::Failed);
+            assert_eq!(
+                git_run(&h.remote.origin, &["branch", "--list", "helm/HELM-1"]),
+                ""
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_check_keeps_its_output_and_does_not_publish() {
+        let h = Harness::with_checks(
+            "sup-checks-timeout",
+            &["printf before; sleep 30"],
+            Duration::from_millis(100),
+        );
+        let card = h.card("success", "").await;
+        let run = h.settled(card).await;
+        assert_eq!(run.status, RunStatus::Failed);
+        let verification =
+            h.db.call(move |conn| checks::get(conn, run.id))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(verification.status, VerificationStatus::Failed);
+        assert_eq!(verification.checks[0].stdout, "before");
+        assert!(verification.checks[0].error.is_some());
+        assert_eq!(
+            git_run(&h.remote.origin, &["branch", "--list", "helm/HELM-1"]),
+            ""
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_check_interrupts_its_result_and_does_not_push() {
+        let h = Harness::with_checks(
+            "sup-checks-cancel",
+            &["touch ../check-started; sleep 30"],
+            Duration::from_secs(60),
+        );
+        let card = h.card("success", "").await;
+        h.wait_for_file("check-started").await;
+        let run = h.latest(card).await;
+        h.orchestrator.cancel(&h.db, run.id).await.unwrap();
+        let run = h.settled(card).await;
+        assert_eq!(run.status, RunStatus::Cancelled);
+        let verification =
+            h.db.call(move |conn| checks::get(conn, run.id))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(verification.status, VerificationStatus::Interrupted);
+        assert_eq!(
+            verification.checks[0].status,
+            checks::CheckStatus::Interrupted
+        );
+        assert_eq!(
+            git_run(&h.remote.origin, &["branch", "--list", "helm/HELM-1"]),
+            ""
+        );
+    }
+
+    fn github_snapshot(head: &str) -> serde_json::Value {
+        serde_json::json!({
+            "number": 7, "url": "https://github.com/owner/repo/pull/7",
+            "state": "OPEN", "isDraft": false, "headRefOid": head,
+            "headRefName": "helm/HELM-1", "baseRefName": "main", "isCrossRepository": false,
+            "statusCheckRollup": [], "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN", "reviewDecision": ""
+        })
+    }
+
+    #[tokio::test]
+    async fn successful_checks_and_push_create_a_ready_pr_with_the_actual_commit() {
+        let mut h = Harness::with_checks(
+            "sup-checks-github",
+            &["touch ../check-started; while [ ! -f ../check-continue ]; do sleep 0.01; done"],
+            Duration::from_secs(5),
+        );
+        h.enable_github();
+        let state = h.remote.repo.with_extension("gh");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("list.json"), "[]").unwrap();
+        let card = h.card("success", "").await;
+        h.wait_for_file("check-started").await;
+        let head = git_run(&h.remote.repo, &["rev-parse", "helm/HELM-1"]);
+        std::fs::write(
+            state.join("after-create.json"),
+            github_snapshot(&head).to_string(),
+        )
+        .unwrap();
+        std::fs::write(h.remote.worktrees.join("check-continue"), "go").unwrap();
+        let run = h.settled(card).await;
+        assert_eq!(run.status, RunStatus::Succeeded, "{:?}", run.error);
+        let pr =
+            h.db.call(move |conn| crate::delivery::get(conn, card))
+                .await
+                .unwrap()
+                .expect("created PR");
+        assert_eq!(pr.run_id, run.id);
+        assert_eq!(pr.pr.head_sha, head);
+        assert!(!pr.pr.draft);
+        assert!(
+            std::fs::read_to_string(state.join("create.body"))
+                .unwrap()
+                .contains(&head)
+        );
+        assert_eq!(h.column_category(card).await, Category::InReview);
+    }
+
+    #[tokio::test]
+    async fn cancelling_pr_publication_keeps_the_pushed_commit_available_for_retry() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut h = Harness::with_checks("sup-published-cancel", &["true"], Duration::from_secs(2));
+        let state = h.remote.repo.with_extension("gh");
+        std::fs::create_dir_all(&state).unwrap();
+        let command = h.remote.dir.join("slow-gh");
+        let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake-gh.sh");
+        std::fs::write(&command, format!("#!/bin/sh\nif [ ! -f \"$PWD.gh/retry\" ]; then touch \"$PWD.gh/started\"; sleep 30; fi\nexec '{fake}' \"$@\"\n")).unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let delivery = h.enable_github_command(command);
+        let card = h.card("success", "").await;
+        for _ in 0..200 {
+            if state.join("started").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(state.join("started").exists());
+        let active = h.latest(card).await;
+        h.orchestrator.cancel(&h.db, active.id).await.unwrap();
+        let run = h.settled(card).await;
+        assert_eq!(
+            run.status,
+            RunStatus::Succeeded,
+            "a successful push remains publishable"
+        );
+        assert!(run.pushed_at.is_some());
+        let head = git_run(&h.remote.origin, &["rev-parse", "helm/HELM-1"]);
+        std::fs::write(state.join("retry"), "go").unwrap();
+        std::fs::write(state.join("list.json"), "[]").unwrap();
+        std::fs::write(
+            state.join("after-create.json"),
+            github_snapshot(&head).to_string(),
+        )
+        .unwrap();
+        delivery.retry(card).await.unwrap();
+        assert!(
+            h.db.call(move |conn| crate::delivery::get(conn, card))
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

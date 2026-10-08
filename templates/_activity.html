@@ -20,6 +20,63 @@
     {% if !run.cost_display().is_empty() %}<div><dt>Coût</dt><dd>{{ run.cost_display() }}</dd></div>{% endif %}
     {% if !run.tokens_display().is_empty() %}<div><dt>Jetons (entrée → sortie)</dt><dd>{{ run.tokens_display() }}</dd></div>{% endif %}
   </dl>
+  <h4 class="activity-section__title">Vérifications locales</h4>
+  {% if let Some(verification) = verification %}
+  <dl class="activity__facts">
+    <div><dt>État</dt><dd>{{ verification.status.label() }}</dd></div>
+    <div><dt>Commit vérifié</dt><dd><code>{{ verification.commit_sha }}</code></dd></div>
+  </dl>
+  {% if verification.checks.is_empty() %}
+  <p class="activity__empty">Aucune commande configurée. Vérifications non exécutées.</p>
+  {% endif %}
+  {% for check in verification.checks %}
+  <details class="activity__details">
+    <summary><code>{{ check.command }}</code> · {{ check.status.label() }}</summary>
+    <p>Code de retour : {% if let Some(code) = check.exit_code %}{{ code }}{% else %}aucun{% endif %}</p>
+    {% if let Some(error) = check.error %}<p class="form__error">{{ error }}</p>{% endif %}
+    <p>Sortie standard</p>
+    {% if check.stdout.is_empty() %}<p class="activity__empty">Aucune sortie standard.</p>{% else %}<pre>{{ check.stdout }}</pre>{% endif %}
+    <p>Sortie d'erreur</p>
+    {% if check.stderr.is_empty() %}<p class="activity__empty">Aucune sortie d'erreur.</p>{% else %}<pre>{{ check.stderr }}</pre>{% endif %}
+  </details>
+  {% endfor %}
+  {% else %}
+  <p class="activity__empty">Non exécutées. Aucun résultat de vérification pour cette exécution.</p>
+  {% endif %}
+  <h4 class="activity-section__title">Pull request GitHub</h4>
+  {% if !github_enabled %}<p class="activity__empty">GitHub désactivé pour ce projet.</p>{% endif %}
+  {% if let Some(delivery) = delivery %}
+  <dl class="activity__facts">
+    <div><dt>Pull request</dt><dd><a href="{{ delivery.pr.url }}">{{ delivery.repository }} #{{ delivery.pr.number }}</a></dd></div>
+    <div><dt>État GitHub</dt><dd>{{ delivery.pr.state_label() }}</dd></div>
+    <div><dt>Contrôles CI</dt><dd>{{ delivery.pr.checks_label() }}</dd></div>
+    <div><dt>Commit de la PR</dt><dd><code>{{ delivery.pr.head_sha }}</code></dd></div>
+    <div><dt>Dernière actualisation</dt><dd><time datetime="{{ delivery.refreshed_iso() }}">{{ delivery.refreshed_display() }}</time></dd></div>
+  </dl>
+  {% if delivery.run_id != run.id %}<p class="notice">Cette PR correspond à une exécution précédente.</p>{% endif %}
+  {% if let Some(verification) = verification %}{% if verification.commit_sha != delivery.pr.head_sha %}<p class="notice">Le commit de la PR diffère du commit vérifié. Une nouvelle vérification est nécessaire avant la fusion.</p>{% endif %}{% endif %}
+  {% if let Some(error) = delivery.error %}<p class="form__error" role="alert">{{ error }}</p>{% endif %}
+  {% if let Some(blocker) = delivery.pr.merge_blocker() %}<p class="field__hint">{{ blocker }}</p>{% endif %}
+  {% if github_enabled && !run.status.is_active() %}
+  <div class="form__actions">
+    <form method="post" action="/cards/{{ run.card_id }}/pull-request/refresh" data-run-form>
+      <button class="button" type="submit">Actualiser la PR</button>
+    </form>
+    {% if crate::routes::can_merge(run, verification, delivery) %}
+    <form method="post" action="/cards/{{ run.card_id }}/pull-request/merge" data-run-form>
+      <button class="button button--primary" type="submit">Fusionner la PR</button>
+    </form>
+    {% endif %}
+  </div>
+  {% endif %}
+  {% else %}
+  <p class="activity__empty">Aucune PR enregistrée pour cette carte.</p>
+  {% endif %}
+  {% if github_enabled && crate::routes::can_publish(run, verification, delivery) %}
+  <form method="post" action="/cards/{{ run.card_id }}/pull-request/publish" data-run-form>
+    <button class="button" type="submit">Créer la PR / Réessayer</button>
+  </form>
+  {% endif %}
   {% if activity.events.is_empty() %}
   <p class="activity__empty">Aucun événement pour l'instant.</p>
   {% else %}

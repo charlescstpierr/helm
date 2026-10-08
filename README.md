@@ -1,9 +1,9 @@
 # helm
 
-Kanban auto-hébergé en Rust pour développeur solo, destiné à orchestrer des agents de code
-(`claude -p`, `codex exec`). Cette version livre le tableau, les commentaires et une première
-tranche de l'orchestration (Claude, une branche poussée par carte) ; la suite est conçue dans
-[docs/architecture.md](docs/architecture.md).
+Kanban auto-hébergé en Rust pour développeur solo. Helm lance Claude dans un worktree par
+carte, exécute vos vérifications, pousse la branche et peut ouvrir une PR GitHub prête à
+relire. La fusion reste une action explicite. Le tableau et les commentaires fonctionnent
+aussi sans agent ni GitHub. Voir [docs/architecture.md](docs/architecture.md).
 
 ## Lancer
 
@@ -40,6 +40,10 @@ Tout est optionnel. Ordre de priorité : variables d'environnement, puis fichier
 | `agents.claude.command` |                     | `claude`         | Exécutable de Claude Code.                     |
 | `agents.claude.permission_mode` |             | `bypassPermissions` | `--permission-mode` des exécutions.         |
 | `agents.claude.model` |                       | celui du CLI     | Modèle des cartes qui n'en nomment pas.        |
+| `checks.commands` |                           | `[]`             | Commandes shell exécutées dans l'ordre, dans le worktree, avant le push. |
+| `checks.timeout_minutes` |                    | `10`             | Durée maximale de chaque commande de vérification. |
+| `github.repository` |                         | aucun            | Dépôt sur github.com, au format `owner/repo`. Active les PR GitHub. |
+| `github.command` |                            | `gh`             | Exécutable du CLI GitHub, trouvé dans `PATH` ou désigné par son chemin. |
 
 Le fichier lu est `helm.toml` dans le répertoire courant s'il existe, ou celui désigné par
 `HELM_CONFIG`. Un `helm.toml` absent laisse les défauts ; un fichier présent mais illisible ou
@@ -65,7 +69,8 @@ faire », une exécution est mise en file : Helm crée le worktree `<racine>/<CL
 branche `helm/<CLÉ>-<n>`, lance `claude -p` dedans (mode `bypassPermissions` par défaut), garde
 chaque événement du flux (affiché en direct dans « Activité de l'agent » : statut, branche, session, coût, jetons, journal, sortie d'erreur, consigne), puis pousse vers `origin` les commits de la branche qu'`origin` n'a pas encore (ceux de cette exécution ou d'une précédente dont le push avait échoué). Succès : la carte
 passe en « En revue » si elle est encore « En cours » (déplacée à la main entre-temps, elle y reste). Échec (agent, rien de nouveau à pousser, `origin` injoignable ou divergent, push refusé) : elle reste « En cours » et
-l'erreur est affichée sur la carte et ajoutée à son fil. Aucune PR n'est ouverte et les worktrees ne sont pas nettoyés.
+l'erreur est affichée sur la carte et ajoutée à son fil. Les worktrees ne sont pas nettoyés
+automatiquement. Les vérifications et les PR se configurent séparément, comme décrit ci-dessous.
 Une ligne de sortie de plus de 1 Mio est tronquée (son début est gardé, le journal le signale) sans
 interrompre l'exécution. Un agent encore actif après `agents.run_timeout_minutes` est arrêté comme
 par une annulation, et l'exécution échoue avec la limite pour motif.
@@ -77,6 +82,82 @@ exécution sur la même carte est refusée tant que ce groupe de processus exist
 exécution ayant lancé un agent compte). Le message dit de vérifier ce qu'est ce processus avant de
 l'arrêter (`kill -- -<pid>`), car Helm ne peut pas le distinguer d'un processus qui aurait reçu le
 même numéro.
+
+## Vérifier le travail avant le push
+
+Ajoutez les commandes de votre projet dans `helm.toml`. Par exemple, pour ce dépôt Rust :
+
+```toml
+[checks]
+commands = [
+    "cargo fmt --check",
+    "cargo clippy --all-targets --locked -- -D warnings",
+    "cargo test --locked",
+]
+timeout_minutes = 10
+```
+
+Après le succès de l'agent, Helm exécute chaque chaîne avec `sh -c` dans le worktree de la
+carte. Les commandes partagent les droits et l'environnement du processus Helm. Au premier
+échec ou dépassement de délai, Helm arrête les vérifications et ne pousse rien. Une annulation
+arrête aussi le groupe de processus du contrôle en cours.
+
+Les résultats portent sur un commit précis. Quand des commandes ou GitHub sont configurés,
+Helm exige un worktree propre et la branche attendue avant et après les contrôles, puis juste
+avant le push. Un changement du commit ou des fichiers bloque la publication. Helm pousse le
+commit vérifié, sans forcer.
+
+La carte affiche le SHA, chaque commande, son état, son code de retour et ses sorties standard
+et d'erreur. Chaque sortie est limitée à 1 Mio, avec une mention si elle est tronquée.
+Sans commande configurée, les vérifications sont « Non exécutées », jamais « Réussies ».
+Les anciens fichiers de configuration restent valides.
+
+## Publier et fusionner une PR GitHub
+
+Installez [GitHub CLI](https://cli.github.com/) sur la machine qui lance Helm.
+Authentifiez-le avec un compte autorisé à pousser et à gérer les PR du dépôt :
+
+```sh
+gh auth login --hostname github.com
+gh auth status --hostname github.com
+```
+
+Configurez le dépôt GitHub correspondant au remote `origin` de `project.repo` :
+
+```toml
+[github]
+repository = "owner/repo"
+# command = "/chemin/vers/gh" # sinon, gh dans PATH
+```
+
+Sans section `[github]`, cette intégration reste désactivée. Elle exige aussi `project.repo`
+et une écoute sur loopback. Cette version utilise github.com.
+
+Après le push, Helm crée ou retrouve la PR de la branche vers la branche par défaut du dépôt
+et la rend prête à relire. Lors de la création, son corps indique le commit vérifié et les
+résultats locaux.
+Le lien apparaît dans l'activité et le fil de la carte. Si GitHub est indisponible ou si la
+publication de la PR est annulée après le push, l'exécution reste réussie. Le bouton
+« Créer la PR / Réessayer » reprend la publication sans relancer l'agent.
+
+L'activité affiche l'état de la PR, ses contrôles CI et la dernière actualisation.
+« Aucun contrôle » signifie qu'aucun contrôle CI n'a été déclaré, pas qu'un contrôle a réussi.
+Helm actualise les PR des cartes non terminées en arrière-plan, avec une période de 30 secondes.
+« Actualiser la PR » permet aussi une actualisation manuelle.
+
+« Fusionner la PR » demande une fusion squash. Helm relit GitHub, vérifie le commit, la branche
+et la base attendus, puis transmet le SHA attendu à `gh`. Une PR en brouillon, une CI en cours,
+échouée ou inconnue, une revue bloquante ou une protection GitHub empêche la fusion.
+Helm ne force pas et n'utilise pas de privilège administrateur. L'absence de vérifications
+locales ou de contrôles CI reste visible et n'empêche pas à elle seule une fusion explicite.
+
+Helm passe automatiquement la carte à « Terminé » seulement après confirmation de la fusion
+de la PR correspondant à la dernière exécution de la carte. Cette exécution doit être réussie,
+et son commit vérifié ainsi que les branches doivent correspondre à la PR publiée. Une exécution
+active ou une PR périmée bloque cette mise à jour. Une fusion effectuée directement sur GitHub
+est reconnue à l'actualisation. Les déplacements manuels de carte restent possibles.
+Les boutons de publication, d'actualisation et de fusion sont des formulaires POST utilisables
+avec ou sans JavaScript.
 
 ## Architecture
 
@@ -94,14 +175,15 @@ données, cycle de vie des cartes et conception de l'orchestrateur :
 ## Développer
 
 ```sh
-cargo test                                   # cartes, commentaires, migrations, routes, orchestrateur
-cargo clippy --all-targets -- -D warnings
 cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
 ```
 
-Les tests de l'orchestrateur n'appellent ni `claude` ni le réseau : ils lancent
-`tests/fixtures/fake-claude.sh`, qui rejoue des flux enregistrés (le scénario est la ligne
-`SCENARIO: …` de la consigne), avec un vrai `git` et un dépôt `origin` nu temporaire.
+Les tests n'appellent ni Claude ni GitHub réels. `tests/fixtures/fake-claude.sh` rejoue des
+flux enregistrés, selon la ligne `SCENARIO: …` de la consigne. `tests/fixtures/fake-gh.sh`
+simule les réponses et les mutations de PR. Les parcours utilisent un vrai `git`, des dépôts
+temporaires et un `origin` nu local.
 
 En build de développement (`cargo run`), `assets/` est relu depuis le disque à chaque requête :
 le CSS et le JavaScript se modifient sans recompiler. Les gabarits de `templates/`, eux, sont
