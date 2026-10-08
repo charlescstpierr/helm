@@ -21,6 +21,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "comments",
         sql: include_str!("../migrations/0002_comments.sql"),
     },
+    Migration {
+        version: 3,
+        name: "autoincrement_comment_ids",
+        sql: include_str!("../migrations/0003_autoincrement_comment_ids.sql"),
+    },
 ];
 
 struct Migration {
@@ -244,7 +249,10 @@ mod tests {
 
         migrate(&mut conn).unwrap();
 
-        assert_eq!(schema_version(&conn).unwrap(), 2);
+        assert_eq!(
+            schema_version(&conn).unwrap(),
+            MIGRATIONS.last().unwrap().version
+        );
         let (title, description): (String, String) = conn
             .query_row(
                 "SELECT title, description FROM cards WHERE id = 1",
@@ -302,6 +310,70 @@ mod tests {
         assert!(insert(1, "robot").is_err());
         assert!(insert(99, "human").is_err());
         assert!(insert(1, "system").is_ok());
+    }
+
+    #[test]
+    fn comment_and_mention_ids_survive_the_autoincrement_rebuild_and_are_never_reused() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        apply(&mut conn, &MIGRATIONS[..2]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO cards (project_id, column_id, number, title, position) VALUES
+                 (1, 1, 1, 'A', 0), (1, 1, 2, 'B', 1);
+             INSERT INTO comments (card_id, author_kind, author, body) VALUES
+                 (1, 'human', 'moi', '@codex one'), (2, 'human', 'moi', '@claude two');
+             INSERT INTO mentions (comment_id, target, handled_at) VALUES
+                 (1, 'codex', 7), (2, 'claude', NULL);",
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        assert_eq!(count(&conn, "comments"), 2);
+        let mentions: Vec<(i64, i64, String, Option<i64>)> = conn
+            .prepare("SELECT id, comment_id, target, handled_at FROM mentions ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            mentions,
+            [
+                (1, 1, "codex".to_owned(), Some(7)),
+                (2, 2, "claude".to_owned(), None)
+            ]
+        );
+
+        // Deleting the newest card removes its newest comment and mention; the next ones must
+        // not take their ids.
+        conn.execute("DELETE FROM cards WHERE id = 2", []).unwrap();
+        assert_eq!(count(&conn, "comments"), 1);
+        assert_eq!(count(&conn, "mentions"), 1);
+        conn.execute(
+            "INSERT INTO comments (card_id, author_kind, author, body) VALUES (1, 'human', 'moi', '@moi three')",
+            [],
+        )
+        .unwrap();
+        let comment_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO mentions (comment_id, target) VALUES (?1, 'moi')",
+            [comment_id],
+        )
+        .unwrap();
+        let mention_id = conn.last_insert_rowid();
+        assert_eq!((comment_id, mention_id), (3, 3));
+
+        // The rebuilt foreign keys still cascade, and still point at the live tables.
+        conn.execute("DELETE FROM cards WHERE id = 1", []).unwrap();
+        assert_eq!(count(&conn, "comments"), 0);
+        assert_eq!(count(&conn, "mentions"), 0);
+        let dangling: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(dangling, 0);
     }
 
     #[test]

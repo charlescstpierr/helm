@@ -104,7 +104,7 @@ des agents (voir les décisions ouvertes).
 
 ## 3. Modèle de données
 
-### Livré (migrations `0001_init` et `0002_comments`)
+### Livré (migrations `0001_init` à `0003_autoincrement_comment_ids`)
 
 ```
 projects 1──* board_columns 1──* cards *──* labels
@@ -131,12 +131,13 @@ projects 1──* board_columns 1──* cards *──* labels
   (0–7) désigne une variable CSS `--label-N` : la base ne stocke aucune couleur, la charte
   reste maîtresse du rendu.
 
-- **`comments`** — `card_id` (suppression en cascade avec la carte), `author_kind`
+- **`comments`** — `id` (`AUTOINCREMENT`, jamais réattribué : un curseur ou un lien sur un ancien
+  commentaire ne peut pas atteindre celui d'un autre), `card_id` (suppression en cascade avec la carte), `author_kind`
   (`human` | `agent` | `system`, contraint en base), `author` (nom affiché : `moi`, `claude`,
   `codex`…), `body` (source Markdown, affiché en texte brut échappé, retours à la ligne
   conservés), `created_at`. Le fil d'une carte est lu par `id` croissant. Il n'y a ni édition
   ni suppression d'un commentaire.
-- **`mentions`** — `comment_id` (cascade), `target`, `handled_at`. Extraites dans la même
+- **`mentions`** — `id` (`AUTOINCREMENT`), `comment_id` (cascade), `target`, `handled_at`. Extraites dans la même
   transaction que le commentaire, une ligne par cible distincte. L'ensemble des cibles est
   fermé et vit dans `src/mentions.rs` (`@claude`, `@codex`, `@moi`) : `@param` ou une adresse
   électronique (`nom@codex.com`) ne crée aucune mention, car personne ne la traiterait. La base
