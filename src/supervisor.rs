@@ -17,11 +17,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rusqlite::Connection;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Notify, Semaphore};
 
-use crate::adapter::{AgentAdapter, Finish, Launch, ParsedLine, Verdict};
+use crate::adapter::{self, AgentAdapter, Finish, Launch, ParsedLine, Verdict};
 use crate::agent::{Agent, ModelName, PermissionMode};
 use crate::changes::Changes;
 use crate::config::RunGate;
@@ -35,6 +35,8 @@ use crate::store::{self, Author, Category, StoreError};
 const PUBLISH_EVERY: Duration = Duration::from_millis(250);
 const TERMINATE_GRACE: Duration = Duration::from_secs(3);
 /// How long a shutdown waits for the runs it stopped to record their end.
+/// The longest stdout line kept whole; the rest of a longer line is read and dropped.
+const MAX_LINE_BYTES: usize = 1024 * 1024;
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
 const STDERR_DRAIN: Duration = Duration::from_secs(2);
 const STDERR_KEPT_BYTES: usize = 256 * 1024;
@@ -309,6 +311,65 @@ async fn unless_cancelled<T>(cancel: &Notify, future: impl Future<Output = T>) -
     }
 }
 
+/// How the agent's stream stopped.
+enum Ended {
+    Exited(Exit),
+    Cancelled,
+    TimedOut,
+}
+
+fn describe(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds >= 60 && seconds % 60 == 0 {
+        format!("{} min", seconds / 60)
+    } else {
+        format!("{seconds} s")
+    }
+}
+
+/// A stdout line being read: the part Helm keeps, and how many bytes past the cap it dropped.
+#[derive(Default)]
+struct Line {
+    kept: Vec<u8>,
+    dropped: usize,
+}
+
+impl Line {
+    fn is_empty(&self) -> bool {
+        self.kept.is_empty() && self.dropped == 0
+    }
+
+    fn clear(&mut self) {
+        self.kept.clear();
+        self.dropped = 0;
+    }
+}
+
+/// Reads up to the next newline into `line`, keeping at most `cap` bytes and dropping the
+/// rest as it goes, so one huge line never sits in memory. `Ok(false)` is the end of the
+/// stream. Safe to cancel between calls: `line` holds the progress.
+async fn read_line(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    line: &mut Line,
+    cap: usize,
+) -> std::io::Result<bool> {
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            return Ok(!line.is_empty());
+        }
+        let newline = chunk.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(chunk.len(), |at| at + 1);
+        let keep = take.min(cap.saturating_sub(line.kept.len()));
+        line.kept.extend_from_slice(&chunk[..keep]);
+        line.dropped += take - keep;
+        reader.consume(take);
+        if newline.is_some() {
+            return Ok(true);
+        }
+    }
+}
+
 /// How the process ended, reduced to what a verdict needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Exit {
@@ -358,6 +419,7 @@ pub struct SupervisorConfig {
     pub repo: PathBuf,
     pub worktree_root: PathBuf,
     pub max_concurrent: usize,
+    pub run_timeout: Duration,
 }
 
 /// The background task: claims queued runs, up to the concurrency limit, and drives them.
@@ -510,8 +572,17 @@ impl Supervisor {
         let mut finish = None;
         let ended = self.stream(run, &mut child, &mut finish, cancel).await;
         let exit = match ended {
-            Some(exit) => exit,
-            None => {
+            Ended::Exited(exit) => exit,
+            Ended::TimedOut => {
+                terminate(&mut child, group.as_ref()).await;
+                self.record_stderr(id, None, stderr_task).await;
+                let why = format!(
+                    "l'agent a dépassé la limite de {} et a été arrêté.",
+                    describe(self.config.run_timeout)
+                );
+                return self.fail(id, why).await;
+            }
+            Ended::Cancelled => {
                 terminate(&mut child, group.as_ref()).await;
                 self.record_stderr(id, None, stderr_task).await;
                 let outcome = self.stopped();
@@ -567,36 +638,40 @@ impl Supervisor {
     }
 
     /// Reads the agent's stdout to its end, storing each line, then waits for the exit.
-    /// `None` means the run was cancelled meanwhile.
     async fn stream(
         &self,
         run: &Run,
         child: &mut Child,
         finish: &mut Option<Finish>,
         cancel: &Notify,
-    ) -> Option<Exit> {
+    ) -> Ended {
         let id = run.id;
         let Some(stdout) = child.stdout.take() else {
-            return Some(Exit {
+            return Ended::Exited(Exit {
                 code: None,
                 signal: None,
             });
         };
         let reading = async {
             let mut reader = BufReader::new(stdout);
-            let mut line = Vec::new();
+            let mut line = Line::default();
             let mut session_recorded = false;
             let mut unpublished = false;
             let mut tick = tokio::time::interval(PUBLISH_EVERY);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
-                    read = reader.read_until(b'\n', &mut line) => match read {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            let text = String::from_utf8_lossy(&line).into_owned();
+                    read = read_line(&mut reader, &mut line, MAX_LINE_BYTES) => match read {
+                        Ok(false) => break,
+                        Ok(true) => {
+                            let text = String::from_utf8_lossy(&line.kept).into_owned();
+                            let parsed = if line.dropped > 0 {
+                                Some(adapter::truncated(&text, line.kept.len() + line.dropped))
+                            } else {
+                                self.adapter.parse_line(&text)
+                            };
                             line.clear();
-                            if let Some(parsed) = self.adapter.parse_line(&text) {
+                            if let Some(parsed) = parsed {
                                 self.store_line(id, parsed, &mut session_recorded, finish).await;
                                 unpublished = true;
                             }
@@ -614,17 +689,21 @@ impl Supervisor {
             }
             child.wait().await
         };
-        let status = unless_cancelled(cancel, reading).await?;
-        match status {
-            Ok(status) => Some(status.into()),
-            Err(e) => {
+        let limited = tokio::time::timeout(self.config.run_timeout, reading);
+        let Some(timed) = unless_cancelled(cancel, limited).await else {
+            return Ended::Cancelled;
+        };
+        match timed {
+            Err(_) => Ended::TimedOut,
+            Ok(Ok(status)) => Ended::Exited(status.into()),
+            Ok(Err(e)) => {
                 self.note(
                     id,
                     EventKind::Error,
                     format!("attente du processus impossible : {e}"),
                 )
                 .await;
-                Some(Exit {
+                Ended::Exited(Exit {
                     code: None,
                     signal: None,
                 })
@@ -883,11 +962,18 @@ mod tests {
     const FAKE_CLAUDE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake-claude.sh");
 
     /// A board with one project repo, a bare origin, and a supervisor driving the fake agent.
+    #[derive(Clone, Copy)]
+    struct Limits {
+        max_concurrent: usize,
+        run_timeout: Duration,
+    }
+
     struct Harness {
         remote: Remote,
         db: Db,
         orchestrator: Orchestrator,
         changes: Changes,
+        limits: Limits,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -897,6 +983,26 @@ mod tests {
         }
 
         fn with_limit(name: &str, max_concurrent: usize) -> Self {
+            Self::build(
+                name,
+                Limits {
+                    max_concurrent,
+                    run_timeout: Duration::from_secs(60),
+                },
+            )
+        }
+
+        fn with_timeout(name: &str, run_timeout: Duration) -> Self {
+            Self::build(
+                name,
+                Limits {
+                    max_concurrent: 2,
+                    run_timeout,
+                },
+            )
+        }
+
+        fn build(name: &str, limits: Limits) -> Self {
             let remote = Remote::new(name);
             let db = Db::open_in_memory().unwrap();
             let orchestrator = Orchestrator::new(
@@ -912,13 +1018,14 @@ mod tests {
                 &db,
                 &orchestrator,
                 &changes,
-                max_concurrent,
+                limits,
             ));
             Self {
                 remote,
                 db,
                 orchestrator,
                 changes,
+                limits,
                 task,
             }
         }
@@ -928,7 +1035,7 @@ mod tests {
             db: &Db,
             orchestrator: &Orchestrator,
             changes: &Changes,
-            max_concurrent: usize,
+            limits: Limits,
         ) -> impl Future<Output = ()> + use<> {
             let supervisor = Supervisor::new(
                 db.clone(),
@@ -940,10 +1047,26 @@ mod tests {
                 SupervisorConfig {
                     repo: remote.repo.clone(),
                     worktree_root: remote.worktrees.clone(),
-                    max_concurrent,
+                    max_concurrent: limits.max_concurrent,
+                    run_timeout: limits.run_timeout,
                 },
             );
             Arc::new(supervisor).run()
+        }
+
+        /// The pid the `group_child` and `session_child` agents write beside their worktree.
+        async fn child_pid(&self, worktree: &str) -> i64 {
+            let marker = self.remote.worktrees.join(format!("{worktree}.child"));
+            for _ in 0..200 {
+                let pid = std::fs::read_to_string(&marker)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<i64>().ok());
+                if let Some(pid) = pid {
+                    return pid;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("the agent never started a child");
         }
 
         /// The card goes back to "À faire" the way a human drags it there.
@@ -967,7 +1090,7 @@ mod tests {
                 &self.db,
                 &self.orchestrator,
                 &self.changes,
-                2,
+                self.limits,
             ));
         }
 
@@ -1203,6 +1326,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_oversized_output_line_is_truncated_and_recorded_without_failing_the_run() {
+        let h = Harness::new("sup-long-line");
+        let card = h.card("long_line", "").await;
+
+        let run = h.settled(card).await;
+
+        assert_eq!(run.status, RunStatus::Succeeded, "{:?}", run.error);
+        let events = h.events(run.id).await;
+        let truncated: Vec<&String> = events
+            .iter()
+            .filter(|(kind, summary)| *kind == EventKind::Malformed && summary.contains("tronquée"))
+            .map(|(_, summary)| summary)
+            .collect();
+        assert_eq!(truncated.len(), 1, "{events:?}");
+        assert!(truncated[0].contains("3000001"), "{}", truncated[0]);
+        let largest: i64 =
+            h.db.call(move |conn| {
+                conn.query_row(
+                    "SELECT MAX(length(payload)) FROM agent_events WHERE run_id = ?1",
+                    [run.id],
+                    |row| row.get(0),
+                )
+                .map_err(StoreError::from)
+            })
+            .await
+            .unwrap();
+        assert!(largest <= MAX_LINE_BYTES as i64 + 4096, "{largest}");
+        assert!(
+            events.iter().any(|(kind, _)| *kind == EventKind::Result),
+            "the lines after the long one are still read"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_still_going_after_the_time_limit_is_stopped_and_fails_with_the_reason() {
+        let h = Harness::with_timeout("sup-timeout", Duration::from_secs(1));
+        let card = h.card("group_child", "").await;
+        let running = h.wait_for(card, |r| r.status == RunStatus::Running).await;
+        let child = h.child_pid("HELM-1").await;
+
+        let run = h.wait_for(card, |r| !r.status.is_active()).await;
+
+        assert_eq!(run.status, RunStatus::Failed, "{:?}", run.error);
+        assert_eq!(run.id, running.id);
+        let error = run.error.as_deref().unwrap();
+        assert!(error.contains("limite de 1 s"), "{error}");
+        assert!(run.pushed_at.is_none());
+        assert_eq!(h.column_category(card).await, Category::InProgress);
+        assert!(h.comments(card).await[0].contains("limite de 1 s"));
+        wait_until_gone(child).await;
+    }
+
+    #[tokio::test]
     async fn a_failed_push_fails_the_run_instead_of_reporting_success() {
         let h = Harness::new("sup-push-fail");
         git_run(
@@ -1355,22 +1531,21 @@ mod tests {
         !process_exists(pid) || is_zombie(pid)
     }
 
+    async fn wait_until_gone(pid: i64) {
+        for _ in 0..200 {
+            if gone(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("process {pid} outlived its run");
+    }
+
     async fn assert_stop_reaps_the_agents_children(name: &str, scenario: &str, stop: Stop) {
         let h = Harness::new(name);
         let card = h.card(scenario, "").await;
         let running = h.wait_for(card, |r| r.status == RunStatus::Running).await;
-        let marker = h.remote.worktrees.join("HELM-1.child");
-        let mut child = None;
-        for _ in 0..200 {
-            child = std::fs::read_to_string(&marker)
-                .ok()
-                .and_then(|text| text.trim().parse::<i64>().ok());
-            if child.is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        let child = child.expect("the agent started a child");
+        let child = h.child_pid("HELM-1").await;
         assert!(!gone(child), "the child runs before the stop");
 
         match stop {
@@ -1386,13 +1561,7 @@ mod tests {
             Stop::Shutdown => RunStatus::Interrupted,
         };
         assert_eq!(run.status, expected, "{scenario}: {:?}", run.error);
-        for _ in 0..200 {
-            if gone(child) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        panic!("{scenario}: the agent's child {child} outlived the stop");
+        wait_until_gone(child).await;
     }
 
     #[tokio::test]
@@ -1621,6 +1790,30 @@ mod tests {
             .wait_for(card, |r| r.id > refused.id && !r.status.is_active())
             .await;
         assert_eq!(run.status, RunStatus::Succeeded, "{:?}", run.error);
+    }
+
+    #[tokio::test]
+    async fn a_line_longer_than_the_cap_is_counted_but_only_its_start_is_kept() {
+        let long = 50_000_000;
+        let stream = tokio::io::repeat(b'x')
+            .take(long)
+            .chain(&b"\nnext\nlast"[..]);
+        let mut reader = BufReader::new(stream);
+        let mut line = Line::default();
+
+        assert!(read_line(&mut reader, &mut line, 1024).await.unwrap());
+        assert_eq!(
+            (line.kept.len(), line.dropped),
+            (1024, long as usize + 1 - 1024)
+        );
+        line.clear();
+        assert!(read_line(&mut reader, &mut line, 1024).await.unwrap());
+        assert_eq!((line.kept.as_slice(), line.dropped), (&b"next\n"[..], 0));
+        line.clear();
+        assert!(read_line(&mut reader, &mut line, 1024).await.unwrap());
+        assert_eq!(line.kept, b"last");
+        line.clear();
+        assert!(!read_line(&mut reader, &mut line, 1024).await.unwrap());
     }
 
     #[test]

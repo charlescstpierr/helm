@@ -17,6 +17,7 @@ db_path = "helm.db"
 #
 # [agents]
 # max_concurrent = 2                                  # runs in flight at once
+# run_timeout_minutes = 60                            # an agent still running after this is stopped; the run fails
 #
 # [agents.claude]
 # command = "claude"                                  # executable, looked up on PATH

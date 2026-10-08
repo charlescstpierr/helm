@@ -159,6 +159,23 @@ fn malformed(line: &str, why: &str) -> ParsedLine {
     }
 }
 
+/// The event for a stdout line longer than Helm keeps: its start, and how long it really was.
+pub fn truncated(kept: &str, total_bytes: usize) -> ParsedLine {
+    ParsedLine {
+        event: NewEvent {
+            kind: EventKind::Malformed,
+            summary: format!(
+                "Ligne tronquée ({total_bytes} octets reçus, {} conservés) : {}",
+                kept.len(),
+                preview(kept)
+            ),
+            payload: kept.to_owned(),
+        },
+        session_id: None,
+        finish: None,
+    }
+}
+
 type Classified = (EventKind, String, Option<Finish>);
 
 fn system_event(value: &Value) -> Classified {

@@ -127,6 +127,7 @@ async fn serve(config: &Config, db: Db) -> Result<(), Box<dyn Error>> {
                     repo: project.repo.clone(),
                     worktree_root: project.worktree_root.clone(),
                     max_concurrent: config.agents.max_concurrent,
+                    run_timeout: config.agents.run_timeout,
                 },
             );
             Some(tokio::spawn(Arc::new(supervisor).run()))

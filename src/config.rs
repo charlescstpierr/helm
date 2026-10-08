@@ -3,6 +3,7 @@
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -13,6 +14,7 @@ pub const DEFAULT_DB_PATH: &str = "helm.db";
 pub const DEFAULT_CONFIG_FILE: &str = "helm.toml";
 pub const DEFAULT_CLAUDE_COMMAND: &str = "claude";
 pub const DEFAULT_MAX_CONCURRENT_RUNS: usize = 2;
+pub const DEFAULT_RUN_TIMEOUT_MINUTES: u64 = 60;
 const DEFAULT_WORKTREE_SUBPATH: &str = ".local/share/helm/worktrees";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +37,8 @@ pub struct ProjectConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentsConfig {
     pub max_concurrent: usize,
+    /// Wall-clock limit on one run's agent, from launch to exit.
+    pub run_timeout: Duration,
     pub claude: ClaudeConfig,
 }
 
@@ -105,6 +109,7 @@ struct FileProject {
 #[serde(deny_unknown_fields)]
 struct FileAgents {
     max_concurrent: Option<usize>,
+    run_timeout_minutes: Option<u64>,
     #[serde(default)]
     claude: FileClaude,
 }
@@ -212,6 +217,20 @@ impl Config {
                 "agents.max_concurrent must be at least 1".to_owned(),
             ));
         }
+        let timeout_minutes = file
+            .agents
+            .run_timeout_minutes
+            .unwrap_or(DEFAULT_RUN_TIMEOUT_MINUTES);
+        let run_timeout = timeout_minutes
+            .checked_mul(60)
+            .filter(|seconds| *seconds > 0 && *seconds <= u64::from(u32::MAX))
+            .map(Duration::from_secs)
+            .ok_or_else(|| {
+                ConfigError(format!(
+                    "agents.run_timeout_minutes must be between 1 and {} (got {timeout_minutes})",
+                    u32::MAX / 60
+                ))
+            })?;
         let claude = file.agents.claude;
         let command = claude
             .command
@@ -228,6 +247,7 @@ impl Config {
             project,
             agents: AgentsConfig {
                 max_concurrent,
+                run_timeout,
                 claude: ClaudeConfig {
                     command,
                     permission_mode: claude.permission_mode.unwrap_or(PermissionMode::DEFAULT),
@@ -310,6 +330,7 @@ mod tests {
         let config = Config::resolve(None, no_env).unwrap();
         assert_eq!(config.project, None);
         assert_eq!(config.agents.max_concurrent, DEFAULT_MAX_CONCURRENT_RUNS);
+        assert_eq!(config.agents.run_timeout, Duration::from_secs(60 * 60));
         assert_eq!(config.agents.claude.command, PathBuf::from("claude"));
         assert_eq!(
             config.agents.claude.permission_mode,
@@ -343,6 +364,7 @@ mod tests {
 
             [agents]
             max_concurrent = 4
+            run_timeout_minutes = 90
 
             [agents.claude]
             command = "/opt/claude"
@@ -354,6 +376,7 @@ mod tests {
         assert_eq!(project.repo, PathBuf::from("/home/dev/code/app"));
         assert_eq!(project.worktree_root, PathBuf::from("/srv/wt"));
         assert_eq!(config.agents.max_concurrent, 4);
+        assert_eq!(config.agents.run_timeout, Duration::from_secs(90 * 60));
         assert_eq!(config.agents.claude.command, PathBuf::from("/opt/claude"));
         assert_eq!(
             config.agents.claude.permission_mode,
@@ -366,6 +389,8 @@ mod tests {
     fn invalid_agent_settings_fail_the_startup() {
         for bad in [
             "[agents]\nmax_concurrent = 0",
+            "[agents]\nrun_timeout_minutes = 0",
+            "[agents]\nrun_timeout_minutes = 18446744073709551615",
             "[agents]\nunknown = 1",
             "[agents.claude]\npermission_mode = \"yolo\"",
             "[agents.claude]\nmodel = \"--oops\"",

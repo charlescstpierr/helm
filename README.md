@@ -36,6 +36,7 @@ Tout est optionnel. Ordre de priorité : variables d'environnement, puis fichier
 | `project.repo`        |                       | aucun            | Dépôt git des cartes. Sans lui, pas d'agents.  |
 | `project.worktree_root` |                     | `~/.local/share/helm/worktrees` | Un worktree par carte : `<racine>/<CLÉ>-<n>`. |
 | `agents.max_concurrent` |                     | `2`              | Exécutions simultanées au plus.                |
+| `agents.run_timeout_minutes` |                | `60`             | Durée maximale d'un agent ; au-delà il est arrêté et l'exécution échoue. |
 | `agents.claude.command` |                     | `claude`         | Exécutable de Claude Code.                     |
 | `agents.claude.permission_mode` |             | `bypassPermissions` | `--permission-mode` des exécutions.         |
 | `agents.claude.model` |                       | celui du CLI     | Modèle des cartes qui n'en nomment pas.        |
@@ -62,6 +63,9 @@ branche `helm/<CLÉ>-<n>`, lance `claude -p` dedans (mode `bypassPermissions` pa
 chaque événement du flux (affiché en direct dans « Activité de l'agent » : statut, branche, session, coût, jetons, journal, sortie d'erreur, consigne), puis pousse la branche vers `origin`. Succès : la carte
 passe en « En revue ». Échec (agent, absence de commit, push refusé) : elle reste « En cours » et
 l'erreur est affichée sur la carte et ajoutée à son fil. Aucune PR n'est ouverte et les worktrees ne sont pas nettoyés.
+Une ligne de sortie de plus de 1 Mio est tronquée (son début est gardé, le journal le signale) sans
+interrompre l'exécution. Un agent encore actif après `agents.run_timeout_minutes` est arrêté comme
+par une annulation, et l'exécution échoue avec la limite pour motif.
 Une exécution en cours peut être annulée depuis la carte. Un arrêt normal de Helm (SIGINT, SIGTERM)
 arrête les agents de la même façon (SIGTERM au groupe de processus, puis SIGKILL après 3 s) et marque
 l'exécution « interrompue ». Si Helm est tué sans préavis, l'exécution est marquée « interrompue »
