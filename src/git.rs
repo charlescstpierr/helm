@@ -173,12 +173,10 @@ pub async fn prepare_worktree(
     Ok(Worktree { path, branch })
 }
 
-/// The commit the worktree is on.
 pub async fn head(worktree: &Path) -> Result<String> {
     git(worktree, &["rev-parse", "HEAD"]).await
 }
 
-/// Commits reachable from the worktree's HEAD but not from `since`: what a run added.
 pub async fn commits_since(worktree: &Path, since: &str) -> Result<u64> {
     let count = git(
         worktree,

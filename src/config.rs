@@ -37,7 +37,6 @@ pub struct ProjectConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentsConfig {
     pub max_concurrent: usize,
-    /// Wall-clock limit on one run's agent, from launch to exit.
     pub run_timeout: Duration,
     pub claude: ClaudeConfig,
 }
@@ -270,8 +269,6 @@ impl Config {
     }
 }
 
-/// Git resolves a relative path against the repository and Helm against its own working
-/// directory, so a relative one would name two different places.
 fn require_absolute(key: &str, path: &Path) -> Result<(), ConfigError> {
     if path.is_absolute() {
         return Ok(());

@@ -305,6 +305,12 @@
 
   const activityElement = () => dialogBody.querySelector('#run-activity');
 
+  function restoreFocus(focused, root) {
+    if (!focused) return;
+    const twin = [...root.querySelectorAll(focused.tagName)].find((el) => el.textContent === focused.textContent);
+    twin?.focus({ preventScroll: true });
+  }
+
   // The activity panel is replaced as a whole; the card form beside it is never touched, so a
   // draft in progress survives the agent's stream of events.
   async function refreshActivity() {
@@ -327,11 +333,7 @@
       for (const details of next.querySelectorAll('details')) {
         if (openDetails.includes(details.querySelector('summary').textContent)) details.open = true;
       }
-      if (focused) {
-        // The panel is replaced as a whole, so the focused element is a new node: find its twin.
-        const twin = [...next.querySelectorAll(focused.tagName)].find((el) => el.textContent === focused.textContent);
-        twin?.focus({ preventScroll: true });
-      }
+      restoreFocus(focused, next);
       // Localised times change line wrapping, so scroll only once the layout is final.
       localizeTimes(next);
       const nextEvents = next.querySelector('.activity__events');

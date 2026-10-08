@@ -34,8 +34,6 @@ use crate::store::{self, Author, Category, StoreError};
 /// How often a busy run tells the open browsers it has news.
 const PUBLISH_EVERY: Duration = Duration::from_millis(250);
 const TERMINATE_GRACE: Duration = Duration::from_secs(3);
-/// How long a shutdown waits for the runs it stopped to record their end.
-/// The longest stdout line kept whole; the rest of a longer line is read and dropped.
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
 const STDERR_DRAIN: Duration = Duration::from_secs(2);
@@ -54,7 +52,6 @@ struct Shared {
     wake: Notify,
     /// One handle per running run, inserted when the run is claimed and removed when it ends.
     cancels: Mutex<HashMap<RunId, Arc<Notify>>>,
-    /// Set once Helm is shutting down: no run is claimed, and every running one is stopped.
     stopping: AtomicBool,
 }
 
@@ -167,9 +164,6 @@ impl Orchestrator {
         .await
     }
 
-    /// Stops every running run the way a cancel does (the agent's whole process group gets
-    /// SIGTERM, then SIGKILL after a grace period) and waits for each to record that it was
-    /// interrupted. Queued runs stay queued for the next start.
     pub async fn shutdown(&self) {
         {
             let cancels = lock(&self.shared.cancels);
@@ -227,8 +221,6 @@ fn log_store_error(context: &str, error: &StoreError) {
     eprintln!("helm: {context}: {error}");
 }
 
-/// A killed Helm leaves its agent running. Helm cannot tell that pid from a recycled one, so
-/// it never signals it: the human, who can, is told how.
 fn still_running_message(pid: i64) -> String {
     format!(
         "l'agent d'une exécution précédente tourne encore (groupe de processus {pid}) : Helm ne lance pas un second agent dans le même worktree. Arrêtez-le avec `kill -- -{pid}`, puis remettez la carte dans « À faire »."
@@ -266,8 +258,6 @@ pub async fn recover(db: &Db, changes: &Changes) -> Result<usize, StoreError> {
     Ok(count)
 }
 
-/// Whether the process group a run led is still populated. The agent is its leader, so this
-/// stays true while any process it started lives, even after the agent itself exited.
 fn group_exists(pid: i64) -> bool {
     // 0 and 1 would not name a group: `kill(-0)` and `kill(-1)` reach this process's group and
     // every process.
@@ -311,7 +301,6 @@ async fn unless_cancelled<T>(cancel: &Notify, future: impl Future<Output = T>) -
     }
 }
 
-/// How the agent's stream stopped.
 enum Ended {
     Exited(Exit),
     Cancelled,
@@ -327,7 +316,6 @@ fn describe(duration: Duration) -> String {
     }
 }
 
-/// A stdout line being read: the part Helm keeps, and how many bytes past the cap it dropped.
 #[derive(Default)]
 struct Line {
     kept: Vec<u8>,
@@ -345,9 +333,7 @@ impl Line {
     }
 }
 
-/// Reads up to the next newline into `line`, keeping at most `cap` bytes and dropping the
-/// rest as it goes, so one huge line never sits in memory. `Ok(false)` is the end of the
-/// stream. Safe to cancel between calls: `line` holds the progress.
+/// Cancel-safe: `line` holds the progress between calls.
 async fn read_line(
     reader: &mut (impl AsyncBufRead + Unpin),
     line: &mut Line,
@@ -511,7 +497,7 @@ impl Supervisor {
 
         let earlier = self
             .db
-            .call(move |conn| runs::interrupted_pids(conn, card_id, id))
+            .call(move |conn| runs::possibly_orphaned_pids(conn, card_id, id))
             .await;
         match earlier {
             Err(e) => return Outcome::Failed(format!("exécutions précédentes illisibles : {e}")),
@@ -775,8 +761,6 @@ impl Supervisor {
         stderr
     }
 
-    /// After a clean agent run: the run must have committed something new, then the branch is
-    /// pushed.
     async fn publish_branch(
         &self,
         id: RunId,
@@ -846,8 +830,6 @@ impl Supervisor {
         }
     }
 
-    /// How a run ends when it was told to stop: cancelled by a human, or interrupted because
-    /// Helm itself is going away.
     fn stopped(&self) -> Outcome {
         if self.orchestrator.stopping() {
             Outcome::Interrupted(STOPPED_BY_SHUTDOWN.to_owned())
@@ -970,13 +952,13 @@ mod tests {
 
     const FAKE_CLAUDE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake-claude.sh");
 
-    /// A board with one project repo, a bare origin, and a supervisor driving the fake agent.
     #[derive(Clone, Copy)]
     struct Limits {
         max_concurrent: usize,
         run_timeout: Duration,
     }
 
+    /// A board with one project repo, a bare origin, and a supervisor driving the fake agent.
     struct Harness {
         remote: Remote,
         db: Db,
@@ -1063,7 +1045,6 @@ mod tests {
             Arc::new(supervisor).run()
         }
 
-        /// Waits for a file the fake agent writes beside its worktree once it has started.
         async fn wait_for_file(&self, name: &str) {
             let path = self.remote.worktrees.join(name);
             for _ in 0..200 {
@@ -1075,7 +1056,6 @@ mod tests {
             panic!("{name} never appeared");
         }
 
-        /// The pid the `group_child` and `session_child` agents write beside their worktree.
         async fn child_pid(&self, worktree: &str) -> i64 {
             let marker = self.remote.worktrees.join(format!("{worktree}.child"));
             for _ in 0..200 {
@@ -1090,7 +1070,6 @@ mod tests {
             panic!("the agent never started a child");
         }
 
-        /// The card goes back to "À faire" the way a human drags it there.
         async fn requeue(&self, card: i64) {
             let orchestrator = self.orchestrator.clone();
             self.db
@@ -1103,7 +1082,6 @@ mod tests {
                 .unwrap();
         }
 
-        /// A new supervisor, as after a restart of Helm.
         fn restart(&mut self) {
             self.task.abort();
             self.task = tokio::spawn(Self::supervisor(
@@ -1492,7 +1470,6 @@ mod tests {
         let first = h.settled(card).await;
         assert_eq!(first.status, RunStatus::Succeeded, "{:?}", first.error);
 
-        // Review sends the card back to "À faire"; the same task commits nothing new.
         let orchestrator = h.orchestrator.clone();
         h.db.call(move |conn| {
             let entered = store::move_card(conn, card, 2, 0)?;
@@ -1789,7 +1766,6 @@ mod tests {
         let mut h = Harness::new("sup-orphan");
         h.task.abort();
         let card = h.card("success", "").await;
-        // The agent of a Helm that was killed with SIGKILL: alive, in its own group.
         use std::os::unix::process::CommandExt;
         let mut orphan = std::process::Command::new("sleep")
             .arg("301")

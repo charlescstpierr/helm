@@ -159,7 +159,6 @@ fn malformed(line: &str, why: &str) -> ParsedLine {
     }
 }
 
-/// The event for a stdout line longer than Helm keeps: its start, and how long it really was.
 pub fn truncated(kept: &str, total_bytes: usize) -> ParsedLine {
     ParsedLine {
         event: NewEvent {
