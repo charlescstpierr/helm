@@ -101,6 +101,8 @@ test "$("${compose[@]}" exec -T helm cat /proc/1/comm)" = tini
     cargo fmt --version
     cargo clippy --version
 '
+echo 'Checking every GitHub command/option against the real gh --help'
+"${compose[@]}" exec -T helm node --input-type=module < "$root/deploy/verify-gh.mjs"
 echo 'Running the Helm target repo checks inside the non-root runtime container'
 "${compose[@]}" exec -T helm sh -ec '
     cd /repo

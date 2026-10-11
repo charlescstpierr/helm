@@ -78,7 +78,7 @@ commands = [
 ]
 ```
 
-L'image inclut Node 24 LTS, Claude Code, GitHub CLI, Git et Rust avec rustfmt et Clippy,
+L'image inclut Node 24 LTS, Claude Code, GitHub CLI 2.102.0, Git et Rust avec rustfmt et Clippy,
 ainsi qu'un compilateur C pour SQLite. Pour un autre langage, adaptez `PROJECT_PACKAGES`
 et la section des outils Rust dans le `Dockerfile` avant de reconstruire. Les vérifications
 s'exécutent dans le conteneur, pas sur l'hôte.
@@ -259,6 +259,10 @@ docker compose logs -f --tail=100 helm cloudflared
 `Ctrl-C` quitte l'affichage des logs sans arrêter les services. La version de Claude Code est
 fixée par `CLAUDE_CODE_VERSION` dans le Dockerfile. Pour la changer, modifiez cette valeur et
 reconstruisez. Les volumes ne sont pas intégrés à l'image et survivent à sa reconstruction.
+GitHub CLI vient du dépôt apt officiel `https://cli.github.com/packages`, vérifié avec sa
+clé dédiée via `signed-by`. Sa version est épinglée par `GH_VERSION=2.102.0` dans le Dockerfile.
+Pour la changer, modifiez ce numéro ainsi que la version attendue dans
+`deploy/verify-gh.mjs`, puis reconstruisez et relancez la vérification locale.
 L'image cloudflared est épinglée à `2026.10.0` dans `docker-compose.yml`. `pull` conserve
 cette version ; pour la mettre à jour, modifiez explicitement ce tag après lecture des
 notes de version, puis tirez l'image et recréez les deux services.
@@ -290,7 +294,8 @@ bash deploy/verify-local.sh
 Ce script construit la même image Helm et utilise un projet Compose temporaire avec des volumes
 neufs. Il remplace le connecteur par un processus local qui garde l'espace réseau ouvert,
 sans tunnel public. Il vérifie HTTP, les domaines, les écritures, l'absence de port publié,
-Tini, les vérifications du clone Helm dans l'image et la persistance après redémarrage et
+Tini, les commandes et options de `src/github.rs` avec l'aide du vrai `gh`, les champs JSON,
+les vérifications du clone Helm dans l'image et la persistance après redémarrage et
 recréation. Il lance aussi le faux agent des tests pour vérifier qu'un SIGTERM permet à Helm
 d'enregistrer l'interruption avant tout redémarrage. Il supprime ensuite ses
 propres conteneurs et volumes. Il ne touche pas au déploiement existant.
