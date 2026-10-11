@@ -9,6 +9,7 @@ scratch=$(mktemp -d)
 project="helm-verify-$(date +%s)-$$"
 image="${project}-helm"
 export TUNNEL_TOKEN=local-verification-no-tunnel
+export GH_TOKEN=local-verification-no-github
 export HELM_PUBLIC_HOST=helm.example.com
 export TARGET_REPO="$scratch/repo"
 compose=(docker compose --project-directory "$root" -p "$project"

@@ -1,6 +1,6 @@
 services:
   cloudflared:
-    image: cloudflare/cloudflared:latest
+    image: cloudflare/cloudflared:2026.10.0
     command: ["tunnel", "--no-autoupdate", "run"]
     environment:
       TUNNEL_TOKEN: ${TUNNEL_TOKEN:?Renseignez TUNNEL_TOKEN dans .env}
@@ -21,6 +21,7 @@ services:
       HELM_DB: /data/helm.db
       HELM_CONFIG: /config/helm.toml
       HELM_PUBLIC_HOST: ${HELM_PUBLIC_HOST:-}
+      GH_TOKEN: ${GH_TOKEN:?Renseignez le jeton GitHub fine-grained GH_TOKEN dans .env}
     volumes:
       - helm_data:/data
       - helm_worktrees:/worktrees

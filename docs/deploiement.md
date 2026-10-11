@@ -26,6 +26,7 @@ Ouvrez `.env` avec un éditeur, par exemple `nano .env`. Remplacez les exemples 
 
 ```dotenv
 TUNNEL_TOKEN=le_token_copie_depuis_cloudflare
+GH_TOKEN=le_jeton_github_fine_grained_du_depot_cible
 HELM_PUBLIC_HOST=helm.votre-domaine.com
 TARGET_REPO=./deploy/repo
 ```
@@ -34,7 +35,7 @@ Le hostname n'a ni `https://`, ni port, ni chemin, ni joker. Il doit correspondr
 à celui déclaré dans Cloudflare. Sans cette valeur, seuls les noms d'hôte locaux sont acceptés.
 Ne publiez jamais `.env`. Il est ignoré par Git et exclu du contexte de build Docker.
 Évitez de partager la sortie de `docker compose config` ou de `docker inspect`, qui peut
-contenir le token. Pour contrôler le fichier sans afficher les valeurs, utilisez
+contenir les tokens. Pour contrôler le fichier sans afficher les valeurs, utilisez
 `docker compose config --quiet`.
 
 ## 2. Préparer le dépôt sur lequel travailleront les agents
@@ -134,6 +135,38 @@ Références officielles : [tunnel](https://developers.cloudflare.com/cloudflare
 
 ## 4. Construire, démarrer et se connecter aux CLI
 
+### Créer le jeton GitHub limité au dépôt cible
+
+Dans GitHub, ouvrez Settings > Developer settings > Personal access tokens >
+Fine-grained tokens > Generate new token :
+
+1. Donnez-lui un nom, par exemple `Helm`, et une expiration courte adaptée à votre usage.
+2. Choisissez comme Resource owner le propriétaire du dépôt cible. Si c'est une
+   organisation, son approbation peut être nécessaire avant que le jeton fonctionne.
+3. Dans Repository access, choisissez **Only select repositories** et sélectionnez
+   **uniquement le dépôt cible**, par exemple `charlescstpierr/helm`.
+4. Dans Repository permissions, accordez seulement **Contents: Read and write** pour
+   les commits/push et la fusion, et **Pull requests: Read and write** pour les PR.
+   **Metadata: Read-only** est ajouté automatiquement par GitHub. Ne donnez aucun droit
+   d'administration ni permission de compte supplémentaire.
+5. Générez le jeton et copiez-le dans `.env`, à la ligne `GH_TOKEN`. GitHub ne l'affiche
+   qu'une fois. N'utilisez pas un jeton classique avec le scope global `repo`.
+
+`gh` utilise directement `GH_TOKEN`. Le jeton n'est pas copié dans l'image et reste dans
+le fichier `.env` protégé sur l'hôte. N'utilisez pas `gh auth login` par navigateur dans
+ce déploiement : cette connexion OAuth ne serait pas limitée au seul dépôt cible.
+Il n'est pas nécessaire d'enregistrer le PAT avec `gh auth login --with-token`.
+
+Référence : [créer un jeton fine-grained](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#creating-a-fine-grained-personal-access-token).
+La [documentation de gh](https://cli.github.com/manual/gh_auth_login) recommande `GH_TOKEN`
+pour ces jetons. Leur portée doit être validée avec le dépôt réel ; la lecture des contrôles
+CI peut demander des droits supplémentaires selon les contrôles utilisés. Un refus doit
+rester visible, sans élargir automatiquement les permissions ni contourner une revue.
+Les modifications aux fichiers de workflows GitHub Actions peuvent aussi être refusées
+avec ces seuls droits.
+
+### Démarrer et configurer Claude et Git
+
 ```sh
 docker compose config --quiet
 docker compose build
@@ -146,11 +179,17 @@ Le journal Helm doit annoncer `127.0.0.1:7878` et `agents enabled`. Il ne doit p
 « aucune exécution d'agent ne sera lancée ». En cas d'erreur de dépôt, vérifiez le clone,
 ses droits et `TARGET_REPO`. Le tunnel doit apparaître Healthy dans Cloudflare.
 
-Connectez-vous une fois, avec le compte non root du conteneur :
+Si vous aviez déjà enregistré un ancien jeton dans le HOME persistant, révoquez-le dans
+GitHub et retirez la connexion enregistrée, maintenant que le conteneur tourne :
+
+```sh
+docker compose exec helm env -u GH_TOKEN -u GITHUB_TOKEN gh auth logout --hostname github.com
+```
+
+Configurez ensuite Claude et Git une fois, avec le compte non root du conteneur :
 
 ```sh
 docker compose exec helm claude
-docker compose exec helm gh auth login --hostname github.com --git-protocol https
 docker compose exec helm gh auth setup-git --hostname github.com
 docker compose exec helm git config --global user.name "Votre nom"
 docker compose exec helm git config --global user.email "votre-courriel@example.com"
@@ -158,13 +197,22 @@ docker compose exec helm gh auth status --hostname github.com
 ```
 
 Pour Claude, suivez les indications du CLI ; ouvrez l'URL de connexion dans votre navigateur
-sur votre ordinateur ou téléphone si le serveur ne peut pas l'ouvrir. Pour GitHub, choisissez
-la connexion par navigateur et saisissez le code affiché sur la page indiquée. Quittez ensuite
-la session interactive Claude. Aucun port ne doit être publié pour ces connexions.
+sur votre ordinateur ou téléphone si le serveur ne peut pas l'ouvrir. Quittez ensuite la
+session interactive Claude. GitHub utilise le PAT de `GH_TOKEN` ; `gh auth setup-git`
+configure Git pour l'utiliser lors des opérations HTTPS. Aucun port ne doit être publié
+pour ces connexions.
 
 Les connexions, sessions Claude et réglages Git vivent dans le volume `helm_home`, sous
 `/home/helm`, notamment `.claude`, `.claude.json`, `.config/gh` et `.gitconfig`. La base et
 les worktrees ont leurs propres volumes. Le dépôt cible reste dans son dossier sur l'hôte.
+Le nouveau jeton GitHub est fourni par `.env` à chaque création du conteneur, plutôt que
+par une connexion OAuth sauvegardée dans `.config/gh`. Pour le renouveler, remplacez
+`GH_TOKEN` dans `.env`, recréez les deux services et révoquez l'ancien jeton dans GitHub.
+
+**Les agents partagent encore le HOME et le réseau de Helm, et héritent de `GH_TOKEN`.
+Un PAT limité réduit les dépôts exposés, mais n'empêche pas un agent de lire ce jeton,
+les identifiants Claude ou de demander une fusion par l'API locale. L'isolation des agents
+reste un prérequis avant de s'appuyer sur l'étape des revues humaines.**
 
 ## 5. Vérifier l'accès
 
@@ -211,6 +259,9 @@ docker compose logs -f --tail=100 helm cloudflared
 `Ctrl-C` quitte l'affichage des logs sans arrêter les services. La version de Claude Code est
 fixée par `CLAUDE_CODE_VERSION` dans le Dockerfile. Pour la changer, modifiez cette valeur et
 reconstruisez. Les volumes ne sont pas intégrés à l'image et survivent à sa reconstruction.
+L'image cloudflared est épinglée à `2026.10.0` dans `docker-compose.yml`. `pull` conserve
+cette version ; pour la mettre à jour, modifiez explicitement ce tag après lecture des
+notes de version, puis tirez l'image et recréez les deux services.
 
 ## 7. Sauvegarder la base
 
