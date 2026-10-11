@@ -40,8 +40,9 @@ pub struct AppState {
     changes: Changes,
     orchestrator: Orchestrator,
     delivery: Option<Delivery>,
-    /// When bound to loopback, only loopback `Host` names are served (DNS-rebinding guard).
+    /// Loopback binds accept local hosts and the explicitly configured public host.
     loopback_only: bool,
+    public_host: Option<String>,
 }
 
 /// What the card form needs to know about the orchestrator: whether agents can be assigned
@@ -89,13 +90,19 @@ impl AgentsView {
 }
 
 impl AppState {
-    pub fn new(db: Db, loopback_only: bool, orchestrator: Orchestrator) -> Self {
+    pub fn new(
+        db: Db,
+        loopback_only: bool,
+        public_host: Option<String>,
+        orchestrator: Orchestrator,
+    ) -> Self {
         Self {
             db,
             changes: Changes::new(),
             orchestrator,
             delivery: None,
             loopback_only,
+            public_host,
         }
     }
 
@@ -221,7 +228,15 @@ async fn guard(State(state): State<AppState>, request: Request, next: Next) -> R
     let headers = request.headers();
     let host = header_str(headers, header::HOST);
 
-    if state.loopback_only && !host.is_some_and(is_loopback_host) {
+    if state.loopback_only
+        && !host.is_some_and(|host| {
+            is_loopback_host(host)
+                || state
+                    .public_host
+                    .as_ref()
+                    .is_some_and(|allowed| allowed.eq_ignore_ascii_case(host))
+        })
+    {
         return (StatusCode::FORBIDDEN, "Hôte refusé.").into_response();
     }
     let is_write = !matches!(*request.method(), Method::GET | Method::HEAD);
@@ -829,6 +844,7 @@ mod tests {
         router(AppState::new(
             Db::open_in_memory().unwrap(),
             true,
+            None,
             orchestrator(gate),
         ))
     }
@@ -1061,6 +1077,76 @@ mod tests {
         assert!(board.contains("Legit") && !board.contains("Evil"));
     }
 
+    #[tokio::test]
+    async fn configured_public_host_serves_the_board_and_accepts_same_origin_writes() {
+        let app = router(AppState::new(
+            Db::open_in_memory().unwrap(),
+            true,
+            Some("helm.example.com".to_owned()),
+            orchestrator(RunGate::Open),
+        ));
+        let request = Request::builder()
+            .uri("/")
+            .header(header::HOST, "HELM.EXAMPLE.COM")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(send(&app, request).await.0, StatusCode::OK);
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/cards")
+            .header(header::HOST, "helm.example.com")
+            .header(header::ORIGIN, "https://HELM.EXAMPLE.COM")
+            .header("sec-fetch-site", "same-origin")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from("column_id=1&title=Through+Access"))
+            .unwrap();
+        assert_eq!(send(&app, request).await.0, StatusCode::SEE_OTHER);
+        assert!(send(&app, get("/board")).await.2.contains("Through Access"));
+    }
+
+    #[tokio::test]
+    async fn configured_public_host_does_not_allow_other_hosts_or_cross_site_writes() {
+        let app = router(AppState::new(
+            Db::open_in_memory().unwrap(),
+            true,
+            Some("helm.example.com".to_owned()),
+            orchestrator(RunGate::Open),
+        ));
+        for host in [
+            "other.example.com",
+            "helm.example.com.evil.test",
+            "helm.example.com:443",
+        ] {
+            let request = Request::builder()
+                .uri("/")
+                .header(header::HOST, host)
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(send(&app, request).await.0, StatusCode::FORBIDDEN, "{host}");
+        }
+        for (origin, site) in [
+            ("https://evil.example", "same-origin"),
+            ("https://localhost:7878", "same-origin"),
+            ("https://helm.example.com", "cross-site"),
+            ("null", "same-origin"),
+        ] {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("/cards")
+                .header(header::HOST, "helm.example.com")
+                .header(header::ORIGIN, origin)
+                .header("sec-fetch-site", site)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("column_id=1&title=Must+not+exist"))
+                .unwrap();
+            let (status, _, body) = send(&app, request).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(body.contains("Origine refusée"));
+        }
+        assert!(!send(&app, get("/board")).await.2.contains("Must not exist"));
+    }
+
     #[test]
     fn loopback_host_names() {
         for host in [
@@ -1194,7 +1280,12 @@ mod tests {
     #[tokio::test]
     async fn a_card_keeps_its_assignment_when_edited_while_agents_are_unavailable() {
         let db = Db::open_in_memory().unwrap();
-        let open = router(AppState::new(db.clone(), true, orchestrator(RunGate::Open)));
+        let open = router(AppState::new(
+            db.clone(),
+            true,
+            None,
+            orchestrator(RunGate::Open),
+        ));
         post_form(
             &open,
             "/cards",
@@ -1205,6 +1296,7 @@ mod tests {
         let bare = router(AppState::new(
             db.clone(),
             true,
+            None,
             orchestrator(RunGate::NoRepo),
         ));
         let (_, _, page) = send(&bare, get("/cards/1/edit")).await;
@@ -1234,7 +1326,12 @@ mod tests {
 
     fn wired_app() -> (Router, Db) {
         let db = Db::open_in_memory().unwrap();
-        let app = router(AppState::new(db.clone(), true, orchestrator(RunGate::Open)));
+        let app = router(AppState::new(
+            db.clone(),
+            true,
+            None,
+            orchestrator(RunGate::Open),
+        ));
         (app, db)
     }
 
@@ -1282,6 +1379,7 @@ mod tests {
         let app = router(AppState::new(
             db.clone(),
             true,
+            None,
             orchestrator(RunGate::NotLoopback),
         ));
         post_form(&app, "/cards", "column_id=2&title=Task&agent=claude").await;
@@ -1472,7 +1570,7 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         for gate in [RunGate::NoRepo, RunGate::NotLoopback] {
-            let closed = router(AppState::new(db.clone(), true, orchestrator(gate)));
+            let closed = router(AppState::new(db.clone(), true, None, orchestrator(gate)));
             assert_eq!(
                 post_form(&closed, "/cards/1/resume", "source_run_id=1&body=Denied").await,
                 StatusCode::METHOD_NOT_ALLOWED
@@ -1565,7 +1663,7 @@ mod tests {
         repo: std::path::PathBuf,
         command: std::path::PathBuf,
     ) -> Router {
-        let state = AppState::new(db.clone(), true, orchestrator(RunGate::Open));
+        let state = AppState::new(db.clone(), true, None, orchestrator(RunGate::Open));
         let delivery = Delivery::new(
             db.clone(),
             state.changes(),
@@ -1670,7 +1768,12 @@ mod tests {
         assert_eq!(before.refreshed_at, after.refreshed_at);
         assert_eq!(before.pr, after.pr);
 
-        let disabled = router(AppState::new(db.clone(), true, orchestrator(RunGate::Open)));
+        let disabled = router(AppState::new(
+            db.clone(),
+            true,
+            None,
+            orchestrator(RunGate::Open),
+        ));
         let (_, _, body) = send(&disabled, get("/cards/1/activity")).await;
         assert!(body.contains("owner/repo #17"));
         assert!(!body.contains("action=\"/cards/1/pull-request/"));
@@ -1947,7 +2050,7 @@ mod tests {
     #[tokio::test]
     async fn a_new_run_event_wakes_open_browsers_through_the_shared_notifier() {
         let db = Db::open_in_memory().unwrap();
-        let state = AppState::new(db, true, orchestrator(RunGate::Open));
+        let state = AppState::new(db, true, None, orchestrator(RunGate::Open));
         let changes = state.changes();
         let app = router(state);
         let response = app.clone().oneshot(get("/events")).await.unwrap();

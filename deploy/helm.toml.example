@@ -1,0 +1,29 @@
+# Copiez vers deploy/helm.toml. Les chemins sont ceux vus DANS le conteneur.
+bind = "127.0.0.1:7878"
+db_path = "/data/helm.db"
+# Le domaine public vient de HELM_PUBLIC_HOST dans .env.
+
+[project]
+repo = "/repo"
+worktree_root = "/worktrees"
+
+[agents]
+max_concurrent = 2
+run_timeout_minutes = 60
+
+[agents.claude]
+command = "claude"
+permission_mode = "bypassPermissions"
+
+[checks]
+# Vide signifie « Non exécutées ». Ajoutez les commandes de votre projet.
+# Pour Helm : cargo fmt --check, cargo clippy --all-targets --locked -- -D warnings,
+# puis cargo test --locked.
+commands = []
+timeout_minutes = 10
+
+[github]
+# Doit correspondre au remote origin du dépôt monté dans /repo.
+# Pour tester avec Helm, remplacez par charlescstpierr/helm.
+repository = "owner/repo"
+command = "gh"

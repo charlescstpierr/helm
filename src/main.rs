@@ -90,6 +90,7 @@ async fn serve(config: &Config, db: Db) -> Result<(), Box<dyn Error>> {
     let state = routes::AppState::new(
         db.clone(),
         config.bind.ip().is_loopback(),
+        config.public_host.clone(),
         orchestrator.clone(),
     );
     let changes = state.changes();

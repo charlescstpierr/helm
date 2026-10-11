@@ -4,3 +4,4 @@
 *.db-shm
 .env
 helm.toml
+deploy/repo/
