@@ -22,6 +22,8 @@ const DEFAULT_WORKTREE_SUBPATH: &str = ".local/share/helm/worktrees";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub bind: SocketAddr,
+    /// One additional HTTP hostname accepted behind an authenticated proxy.
+    pub public_host: Option<String>,
     pub db_path: PathBuf,
     /// `None` leaves the board as a plain kanban: agents cannot be assigned.
     pub project: Option<ProjectConfig>,
@@ -115,6 +117,7 @@ impl std::error::Error for ConfigError {}
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     bind: Option<String>,
+    public_host: Option<String>,
     db_path: Option<PathBuf>,
     #[serde(default)]
     project: FileProject,
@@ -207,6 +210,26 @@ impl Config {
         let bind = bind
             .parse::<SocketAddr>()
             .map_err(|e| ConfigError(format!("bind address `{bind}`: {e}")))?;
+
+        let public_host = env("HELM_PUBLIC_HOST")
+            .or(file.public_host)
+            .filter(|host| !host.is_empty());
+        if let Some(host) = &public_host {
+            let valid = host.len() <= 253
+                && host.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && label.starts_with(|c: char| c.is_ascii_alphanumeric())
+                        && label.ends_with(|c: char| c.is_ascii_alphanumeric())
+                        && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                });
+            if !valid {
+                return Err(ConfigError(
+                    "public_host must be one hostname without a scheme, port, path or wildcard"
+                        .to_owned(),
+                ));
+            }
+        }
 
         let db_path = env("HELM_DB")
             .map(PathBuf::from)
@@ -315,6 +338,7 @@ impl Config {
 
         Ok(Self {
             bind,
+            public_host,
             db_path,
             project,
             agents: AgentsConfig {
@@ -438,6 +462,50 @@ mod tests {
         assert!(Config::resolve(Some("bind = \"nowhere\""), home_env).is_err());
         assert!(Config::resolve(Some("unknown_key = 1"), home_env).is_err());
         assert!(Config::resolve(Some("db_path = \"\""), home_env).is_err());
+    }
+
+    #[test]
+    fn public_host_can_be_configured_without_changing_the_run_gate() {
+        let file = "public_host = \"helm.example.com\"\n[project]\nrepo = \"/r\"";
+        let config = Config::resolve(Some(file), home_env)
+            .expect("an explicit public hostname must be accepted");
+        assert_eq!(config.run_gate(), RunGate::Open);
+        assert_eq!(config.public_host.as_deref(), Some("helm.example.com"));
+        let env = |key: &str| match key {
+            "HELM_PUBLIC_HOST" => Some("HELM.other.example".to_owned()),
+            "HELM_BIND" => Some("0.0.0.0:7878".to_owned()),
+            other => home_env(other),
+        };
+        let config = Config::resolve(Some(file), env).unwrap();
+        assert_eq!(config.public_host.as_deref(), Some("HELM.other.example"));
+        assert_eq!(config.run_gate(), RunGate::NotLoopback);
+    }
+
+    #[test]
+    fn empty_public_host_keeps_the_default_configuration() {
+        assert_eq!(
+            Config::resolve(Some("public_host = \"\""), home_env).unwrap(),
+            Config::resolve(None, home_env).unwrap()
+        );
+    }
+
+    #[test]
+    fn public_host_rejects_wildcards_and_non_hostnames() {
+        for host in [
+            "*.example.com",
+            "https://helm.example.com",
+            "helm.example.com:443",
+            "helm.example.com/path",
+            "a,b.example",
+            " user.example",
+            "a..example",
+            "-a.example",
+            "a-.example",
+            "user@helm.example.com",
+        ] {
+            let file = format!("public_host = {host:?}");
+            assert!(Config::resolve(Some(&file), home_env).is_err(), "{host}");
+        }
     }
 
     #[test]

@@ -1,0 +1,15 @@
+.git
+.worktrees
+target
+.env
+.env.*
+helm.toml
+deploy/helm.toml
+deploy/repo
+*.db
+*.db-wal
+*.db-shm
+.claude
+.claude.json
+.config
+.gitconfig

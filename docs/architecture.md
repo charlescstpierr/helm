@@ -110,8 +110,11 @@ empêchent une page web ouverte dans le même navigateur de le piloter :
 
 - les écritures dont l'en-tête `Origin` ne correspond pas à `Host`, ou dont `Sec-Fetch-Site`
   n'est ni `same-origin` ni `none`, sont refusées (anti-CSRF) ;
-- quand l'écoute est sur loopback, seuls les noms d'hôte loopback sont servis (anti
-  DNS-rebinding).
+- quand l'écoute est sur loopback, seuls les noms d'hôte loopback et, s'il est configuré,
+  l'unique `public_host` sont servis (anti DNS-rebinding). La comparaison est exacte et
+  ignore la casse ; aucun joker n'est accepté. Vide ou absent, `public_host` conserve le
+  comportement local. Cette option exige un proxy authentifié tel que Cloudflare Access,
+  ne remplace pas l'authentification et ne désactive pas le contrôle same-origin des écritures.
 
 Écouter ailleurs que sur loopback est possible mais affiche un avertissement : il faut alors
 un proxy ou un VPN de confiance devant.

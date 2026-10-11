@@ -4,6 +4,10 @@
 # Adresse d'écoute. Les agents et GitHub exigent une adresse loopback.
 bind = "127.0.0.1:7878"
 
+# Un seul hostname public, uniquement derrière un proxy authentifié (ex. Cloudflare Access).
+# Sans protocole, port, chemin ni joker. Vide = seuls les hôtes locaux sont acceptés.
+# public_host = "helm.example.com"
+
 # Base SQLite créée au premier démarrage, en mode WAL.
 db_path = "helm.db"
 

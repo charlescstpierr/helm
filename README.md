@@ -33,6 +33,7 @@ Tout est optionnel. Ordre de priorité : variables d'environnement, puis fichier
 | Fichier (`helm.toml`) | Environnement         | Défaut           | Rôle                                           |
 | --------------------- | --------------------- | ---------------- | ---------------------------------------------- |
 | `bind`                | `HELM_BIND`           | `127.0.0.1:7878` | Adresse d'écoute.                              |
+| `public_host`         | `HELM_PUBLIC_HOST`    | aucun           | Un seul hostname public accepté en plus des hôtes locaux, derrière un proxy authentifié. |
 | `db_path`             | `HELM_DB`             | `helm.db`        | Fichier SQLite (mode WAL).                     |
 | `project.repo`        |                       | aucun            | Dépôt git des cartes (chemin absolu ou `~/…`). Sans lui, pas d'agents. |
 | `project.worktree_root` |                     | `~/.local/share/helm/worktrees` | Un worktree par carte : `<racine>/<CLÉ>-<n>` (chemin absolu ou `~/…`). |
@@ -56,6 +57,12 @@ Modèle : [helm.example.toml](helm.example.toml).
 
 Helm n'a pas d'authentification : gardez l'écoute sur loopback, ou placez un proxy ou un VPN de
 confiance devant.
+
+Pour Docker avec Cloudflare Tunnel et Access, suivez [le guide de déploiement](docs/deploiement.md).
+`public_host` autorise un hostname HTTP précis, sans protocole, port, chemin ni joker ; vide ou
+absent, le comportement local reste inchangé. La comparaison ignore la casse. Les écritures
+restent soumises au contrôle `Origin` / `Sec-Fetch-Site` : l'origine doit correspondre au `Host`
+accepté. Cette option n'authentifie personne et ne change pas la restriction loopback des agents.
 
 ## Lancer des agents
 

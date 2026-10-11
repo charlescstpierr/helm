@@ -1,0 +1,51 @@
+services:
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?Renseignez TUNNEL_TOKEN dans .env}
+    restart: unless-stopped
+
+  helm:
+    build:
+      context: .
+    network_mode: "service:cloudflared"
+    depends_on:
+      cloudflared:
+        condition: service_started
+        restart: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      HELM_BIND: 127.0.0.1:7878
+      HELM_DB: /data/helm.db
+      HELM_CONFIG: /config/helm.toml
+      HELM_PUBLIC_HOST: ${HELM_PUBLIC_HOST:-}
+    volumes:
+      - helm_data:/data
+      - helm_worktrees:/worktrees
+      # The entire HOME persists .claude, .claude.json, .config/gh and .gitconfig.
+      # A directory volume also permits atomic replacement of credential files.
+      - helm_home:/home/helm
+      - type: bind
+        source: ${TARGET_REPO:?Renseignez TARGET_REPO dans .env}
+        target: /repo
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./deploy/helm.toml
+        target: /config/helm.toml
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:7878/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  helm_data:
+  helm_worktrees:
+  helm_home:
